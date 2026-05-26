@@ -11,6 +11,7 @@ import Login from './pages/Login'
 import Register from './pages/Register'
 import { useAuthStore } from './services/store'
 import wsClient from './services/websocket'
+import { useOutbidNotifier, ensureNotificationPermission } from './hooks/useOutbidNotifier'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { token } = useAuthStore()
@@ -61,9 +62,16 @@ function BottomNav() {
 export default function App() {
   const { token } = useAuthStore()
 
+  // Global subscriptions — must mount once at the app root so they fire
+  // regardless of which page the user is on when the event arrives.
+  useOutbidNotifier()
+
   useEffect(() => {
     if (token) {
       wsClient.connect()
+      // Ask for browser notification permission after auth — by the time
+      // the user logs in they've intentionally engaged with the app.
+      ensureNotificationPermission()
     }
     return () => {
       wsClient.disconnect()

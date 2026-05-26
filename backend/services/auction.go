@@ -399,6 +399,7 @@ func (s *AuctionService) BroadcastBidState(auction *models.Auction, lastBidder s
 			BidCount:     auction.BidCount,
 			LastBidder:   lastBidder,
 			Rankings:     rankings,
+			ViewerCount:  s.hub.GetRoomSize(auction.ID),
 			SecondsLeft:  secondsLeft,
 			EndAtMs:      endAtMs,
 			ServerTimeMs: now.UnixMilli(),
@@ -432,6 +433,7 @@ func (s *AuctionService) SendBidStateTo(client *ws.Client, auction *models.Aucti
 			CurrentPrice: auction.CurrentPrice,
 			BidCount:     auction.BidCount,
 			Rankings:     rankings,
+			ViewerCount:  s.hub.GetRoomSize(auction.ID),
 			SecondsLeft:  secondsLeft,
 			EndAtMs:      endAtMs,
 			ServerTimeMs: now.UnixMilli(),
@@ -441,6 +443,67 @@ func (s *AuctionService) SendBidStateTo(client *ws.Client, auction *models.Aucti
 			Seq: s.hub.NextSeq(auction.ID),
 		}),
 	})
+}
+
+// NotifyOutbid pushes a personal "you've been outbid" alert to each of the
+// userIDs supplied. Called from the bid handler right after a successful
+// bid commit: the prior leaders are the same users we just transitioned
+// from BidActive → BidOutbid in the DB.
+//
+// We use PushToUser (per-user fan-out) rather than the room broadcast so:
+//   - Other room participants don't get confusing notifications.
+//   - The user gets the alert even if they're NOT currently viewing this
+//     auction's room (e.g., they swiped to another auction in the feed
+//     after placing their bid). This is the killer feature.
+func (s *AuctionService) NotifyOutbid(auction *models.Auction, displacedUserIDs []uint, newLeader string, newPrice float64) {
+	if len(displacedUserIDs) == 0 {
+		return
+	}
+	productTitle := ""
+	if auction.Product != nil {
+		productTitle = auction.Product.Title
+	}
+	secondsLeft := 0
+	if auction.EndTime != nil {
+		secondsLeft = int(time.Until(*auction.EndTime).Seconds())
+		if secondsLeft < 0 {
+			secondsLeft = 0
+		}
+	}
+
+	// We need each user's previous bid amount to show "your ¥X was beat
+	// by ¥Y". One query returns max-active-amount per user — cheap.
+	type prevBid struct {
+		UserID uint
+		Amount float64
+	}
+	var prev []prevBid
+	s.db.Raw(`
+		SELECT user_id, MAX(amount) as amount
+		FROM bids
+		WHERE auction_id = ? AND user_id IN (?) AND status = ?
+		GROUP BY user_id
+	`, auction.ID, displacedUserIDs, models.BidOutbid).Scan(&prev)
+
+	prevByUser := make(map[uint]float64, len(prev))
+	for _, p := range prev {
+		prevByUser[p.UserID] = p.Amount
+	}
+
+	for _, uid := range displacedUserIDs {
+		s.hub.PushToUser(uid, ws.Message{
+			Type:      ws.MsgBidOutbid,
+			AuctionID: auction.ID,
+			Data: mustMarshal(ws.BidOutbidData{
+				AuctionID:    auction.ID,
+				ProductTitle: productTitle,
+				YourBid:      prevByUser[uid],
+				CurrentPrice: newPrice,
+				NewLeader:    newLeader,
+				SecondsLeft:  secondsLeft,
+			}),
+		})
+	}
 }
 
 // StartAuction activates a pending auction

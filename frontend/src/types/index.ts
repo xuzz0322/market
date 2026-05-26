@@ -107,6 +107,7 @@ export type WSMessageType =
   | 'leave_auction'
   | 'place_bid'
   | 'bid_update'
+  | 'bid_outbid'
   | 'auction_end'
   | 'auction_start'
   | 'auction_cancel'
@@ -126,10 +127,20 @@ export interface BidUpdateData {
   bid_count: number
   last_bidder: string
   rankings: BidRanking[]
+  viewer_count: number
   seconds_left: number
   end_at_ms: number       // absolute end timestamp (server ms)
   server_time_ms: number  // server "now" at broadcast time
   seq: number             // per-auction monotonic sequence
+}
+
+export interface BidOutbidData {
+  auction_id: number
+  product_title: string
+  your_bid: number
+  current_price: number
+  new_leader: string
+  seconds_left: number
 }
 
 export interface AuctionEndData {

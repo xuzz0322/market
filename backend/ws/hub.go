@@ -14,6 +14,7 @@ const (
 	MsgLeaveAuction  MessageType = "leave_auction"
 	MsgPlaceBid      MessageType = "place_bid"
 	MsgBidUpdate     MessageType = "bid_update"
+	MsgBidOutbid     MessageType = "bid_outbid"   // personal: "you've been outbid"
 	MsgAuctionEnd    MessageType = "auction_end"
 	MsgAuctionStart  MessageType = "auction_start"
 	MsgAuctionCancel MessageType = "auction_cancel"
@@ -26,6 +27,20 @@ const (
 type AuctionCancelData struct {
 	AuctionID uint   `json:"auction_id"`
 	Reason    string `json:"reason"`
+}
+
+// BidOutbidData is the personal "you've been outbid" notification.
+// Sent ONLY to the user who was just displaced by a higher bid — not to
+// the room. The frontend uses this to surface a toast and a "bid again"
+// CTA without needing to diff every bid_update against the user's
+// previous standing.
+type BidOutbidData struct {
+	AuctionID    uint    `json:"auction_id"`
+	ProductTitle string  `json:"product_title"`
+	YourBid      float64 `json:"your_bid"`      // user's previous (now outbid) amount
+	CurrentPrice float64 `json:"current_price"` // the price that beat them
+	NewLeader    string  `json:"new_leader"`    // username of the user who outbid them
+	SecondsLeft  int     `json:"seconds_left"`
 }
 
 // Message is the standard WebSocket message envelope
@@ -54,6 +69,7 @@ type BidUpdateData struct {
 	BidCount     int         `json:"bid_count"`
 	LastBidder   string      `json:"last_bidder"`
 	Rankings     interface{} `json:"rankings"`
+	ViewerCount  int         `json:"viewer_count"`  // live concurrent viewers in the room
 	SecondsLeft  int         `json:"seconds_left"`  // kept for backward compat
 	EndAtMs      int64       `json:"end_at_ms"`     // absolute end time (server time, ms)
 	ServerTimeMs int64       `json:"server_time_ms"` // server's "now" at broadcast time
@@ -73,6 +89,11 @@ type Hub struct {
 	mu       sync.RWMutex
 	clients  map[*Client]bool
 	rooms    map[uint]map[*Client]bool // auctionID -> clients
+	// userClients indexes connections by user_id so we can push targeted
+	// notifications (e.g., "you've been outbid") without scanning every
+	// client. A single user can have multiple connections (mobile + web)
+	// open at once, so the value is a set of clients, not one.
+	userClients map[uint]map[*Client]bool
 	register chan *Client
 	unregister chan *Client
 	broadcast  chan *RoomMessage
@@ -100,12 +121,13 @@ type RoomMessage struct {
 
 func NewHub() *Hub {
 	return &Hub{
-		clients:    make(map[*Client]bool),
-		rooms:      make(map[uint]map[*Client]bool),
-		register:   make(chan *Client, 256),
-		unregister: make(chan *Client, 256),
-		broadcast:  make(chan *RoomMessage, 1024),
-		seqMap:     make(map[uint]uint64),
+		clients:     make(map[*Client]bool),
+		rooms:       make(map[uint]map[*Client]bool),
+		userClients: make(map[uint]map[*Client]bool),
+		register:    make(chan *Client, 256),
+		unregister:  make(chan *Client, 256),
+		broadcast:   make(chan *RoomMessage, 1024),
+		seqMap:      make(map[uint]uint64),
 	}
 }
 
@@ -125,6 +147,12 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
+			// Index by user_id so pushUser can reach all of this user's
+			// connections (e.g., they have phone + web open at once).
+			if h.userClients[client.UserID] == nil {
+				h.userClients[client.UserID] = make(map[*Client]bool)
+			}
+			h.userClients[client.UserID][client] = true
 			h.mu.Unlock()
 			log.Printf("Client registered: user=%d, total=%d", client.UserID, len(h.clients))
 
@@ -132,6 +160,15 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
+				// Remove from user index. Drop the bucket entirely once
+				// the user has no remaining connections so the map
+				// doesn't grow without bound.
+				if conns, ok := h.userClients[client.UserID]; ok {
+					delete(conns, client)
+					if len(conns) == 0 {
+						delete(h.userClients, client.UserID)
+					}
+				}
 				// Remove from all rooms
 				for auctionID, room := range h.rooms {
 					if _, inRoom := room[client]; inRoom {
@@ -282,6 +319,37 @@ func (h *Hub) GetRoomSize(auctionID uint) int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.rooms[auctionID])
+}
+
+// PushToUser fans a message out to all of one user's connected sockets.
+//
+// Use cases:
+//   - "You've been outbid" — personal alert that wouldn't make sense to
+//     room-broadcast (only one user cares).
+//   - "Your auction was won" — for the seller, push to whichever device
+//     they have open (web admin, phone) without spamming everyone else.
+//
+// If the user has no active connections (offline / different device),
+// the message is silently dropped — call sites should NOT depend on
+// PushToUser for durable delivery. For "must-deliver" notifications,
+// pair this with a DB-backed inbox the user reads on next login.
+func (h *Hub) PushToUser(userID uint, msg interface{}) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	// Snapshot under lock then send outside, like our room broadcasts.
+	h.mu.RLock()
+	conns := h.userClients[userID]
+	clients := make([]*Client, 0, len(conns))
+	for c := range conns {
+		clients = append(clients, c)
+	}
+	h.mu.RUnlock()
+
+	for _, c := range clients {
+		h.deliver(c, data)
+	}
 }
 
 func (h *Hub) RegisterClient(client *Client) {

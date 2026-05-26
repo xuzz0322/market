@@ -81,6 +81,11 @@ func (h *BidHandler) PlaceBid(c *gin.Context) {
 		currentUser  models.User
 		newPrice     float64
 		isBuyNow     bool
+		// displacedUsers holds the user IDs that were leading before this
+		// bid landed (i.e., had active bids that we just downgraded to
+		// outbid). We capture them inside the tx so we can notify them
+		// post-commit. NotifyOutbid skips the bidder themself.
+		displacedUsers []uint
 	)
 
 	// Retry loop for transient conflicts (deadlock, version mismatch)
@@ -120,6 +125,22 @@ func (h *BidHandler) PlaceBid(c *gin.Context) {
 			}
 			if currentUser.Balance < req.Amount {
 				return &bidValidationError{Code: 400, Msg: "insufficient balance"}
+			}
+
+			// Capture the previous leader BEFORE we mutate state. The
+			// leader is whoever held a bid equal to the pre-update
+			// current_price — that's the user this new bid is displacing.
+			// Skipped on the very first bid (no one to displace).
+			if auction.BidCount > 0 {
+				var prev struct{ UserID uint }
+				tx.Raw(`
+					SELECT user_id FROM bids
+					WHERE auction_id = ? AND amount = ? AND user_id != ?
+					ORDER BY id DESC LIMIT 1
+				`, auction.ID, auction.CurrentPrice, userID).Scan(&prev)
+				if prev.UserID > 0 {
+					displacedUsers = append(displacedUsers, prev.UserID)
+				}
 			}
 
 			// Mark previous active bids from this user as outbid
@@ -212,6 +233,15 @@ func (h *BidHandler) PlaceBid(c *gin.Context) {
 	bgCancel()
 
 	h.auctionSvc.BroadcastBidState(&auction, currentUser.Username)
+
+	// Personal "you've been outbid" alert. Goroutine'd because the user
+	// may be on a different auction or even offline; the push is
+	// fire-and-forget — no need to make the bidder wait on its delivery.
+	if len(displacedUsers) > 0 {
+		// Reload product so the notification can show the title.
+		h.db.Preload("Product").First(&auction, auction.ID)
+		go h.auctionSvc.NotifyOutbid(&auction, displacedUsers, currentUser.Username, newPrice)
+	}
 
 	if isBuyNow {
 		go h.auctionSvc.EndAuction(&auction)

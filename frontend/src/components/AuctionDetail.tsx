@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import toast from 'react-hot-toast'
-import { ArrowLeft, Eye, Heart, Share2, ChevronUp, Trophy, Zap } from 'lucide-react'
+import { ArrowLeft, Eye, Heart, Share2, ChevronUp, Trophy, Zap, Info, Users, AlertTriangle, Package } from 'lucide-react'
 import type { Auction, BidRanking, BidUpdateData, AuctionEndData } from '../types'
 import { getAuction, placeBid } from '../services/api'
 import wsClient from '../services/websocket'
@@ -35,13 +35,16 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
   const [auction, setAuction] = useState<Auction | null>(null)
   const [rankings, setRankings] = useState<BidRanking[]>([])
   const [endAtMs, setEndAtMs] = useState(0)
+  const [viewerCount, setViewerCount] = useState(0)
   const [bidInput, setBidInput] = useState('')
   const [bidding, setBidding] = useState(false)
   const [particles, setParticles] = useState<Array<{ id: number; amount: number; username: string }>>([])
   const [showBidPanel, setShowBidPanel] = useState(false)
+  const [showRules, setShowRules] = useState(false)
+  const [outbidAlert, setOutbidAlert] = useState<{ leader: string; price: number } | null>(null)
   const [ended, setEnded] = useState(false)
   const [cancelled, setCancelled] = useState<{ reason: string } | null>(null)
-  const [winner, setWinner] = useState<{ name: string; price: number } | null>(null)
+  const [winner, setWinner] = useState<{ name: string; price: number; winnerId?: number } | null>(null)
   const [liked, setLiked] = useState(false)
   const [likeCount, setLikeCount] = useState(0)
 
@@ -64,7 +67,10 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
       if (res.auction.status === 'ended') {
         setEnded(true)
         if (res.auction.winner) {
-          setWinner({ name: res.auction.winner.username, price: res.auction.current_price })
+          setWinner({ name: res.auction.winner.username, price: res.auction.current_price, winnerId: res.auction.winner_id })
+        } else {
+          // No winner — could be reserve-not-met or no bids at all.
+          setWinner({ name: '', price: res.auction.current_price })
         }
       } else if (res.auction.status === 'cancelled') {
         setCancelled({ reason: res.auction.cancel_reason || '卖家取消了拍卖' })
@@ -119,6 +125,11 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
 
       setAuction((prev) => prev ? { ...prev, current_price: data.current_price, bid_count: data.bid_count } : prev)
       setRankings(data.rankings)
+      // Live concurrent viewers in this auction's room — refreshed on
+      // every broadcast so the count reflects in-flight churn.
+      if (typeof data.viewer_count === 'number') {
+        setViewerCount(data.viewer_count)
+      }
       // end_at_ms is the authoritative end time. Update on every message so
       // the timer stays aligned with the server even if our HTTP load was stale.
       if (data.end_at_ms) setEndAtMs(data.end_at_ms)
@@ -134,7 +145,24 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
       const data = msg.data as AuctionEndData
       if (data.auction_id !== auctionId) return
       setEnded(true)
-      setWinner({ name: data.winner_name || '无人竞拍', price: data.final_price })
+      setWinner({
+        name: data.winner_name || '',
+        price: data.final_price,
+        winnerId: data.winner_id,
+      })
+    })
+
+    // Personal "you've been outbid" — only fire the IN-PAGE banner here;
+    // the global notifier (App-mounted) already handles toasts/OS
+    // notifications. The banner gives the user an obvious "再加价" CTA
+    // without scrolling away from the bid panel.
+    const unsubOutbid = wsClient.on('bid_outbid', (msg) => {
+      const data = msg.data as { auction_id: number; new_leader: string; current_price: number }
+      if (data.auction_id !== auctionId) return
+      setOutbidAlert({ leader: data.new_leader, price: data.current_price })
+      // Auto-dismiss after a few seconds so it doesn't permanently
+      // occupy screen real estate.
+      setTimeout(() => setOutbidAlert(null), 5000)
     })
 
     const unsubCancel = wsClient.on('auction_cancel', (msg) => {
@@ -161,11 +189,23 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
       wsClient.leaveAuction(auctionId)
       unsubBid()
       unsubEnd()
+      unsubOutbid()
       unsubCancel()
       unsubState()
       lastSeqRef.current = 0
     }
   }, [auctionId, loadAuction, resync])
+
+  // Mark this auction as the user's current focus so the global outbid
+  // notifier can suppress its banner toast for THIS auction (we already
+  // show the in-page banner). Cleared on unmount.
+  useEffect(() => {
+    ;(window as unknown as { __auctionFocus?: number }).__auctionFocus = auctionId
+    return () => {
+      const w = window as unknown as { __auctionFocus?: number }
+      if (w.__auctionFocus === auctionId) w.__auctionFocus = undefined
+    }
+  }, [auctionId])
 
   const handleBid = async () => {
     if (!user) { toast.error('请先登录'); return }
@@ -277,7 +317,15 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
           <span className="text-white text-xs">{(auction.view_count + likeCount).toLocaleString()}</span>
         </button>
 
-        {/* Views */}
+        {/* Live viewers (concurrent in this room) — different from
+            view_count which is the cumulative all-time visit count. */}
+        <div className="flex flex-col items-center gap-1">
+          <Users size={26} className="text-cyan-400" />
+          <span className="text-white text-xs">{viewerCount}</span>
+          <span className="text-white/50 text-[10px]">在看</span>
+        </div>
+
+        {/* Cumulative views */}
         <div className="flex flex-col items-center gap-1">
           <Eye size={26} className="text-white" />
           <span className="text-white text-xs">{auction.view_count.toLocaleString()}</span>
@@ -293,6 +341,15 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
         <button className="flex flex-col items-center gap-1">
           <Share2 size={26} className="text-white" />
           <span className="text-white text-xs">分享</span>
+        </button>
+
+        {/* Rules — opens a slide-up drawer with the auction's pricing
+            terms. Pulled out of the bottom info area because new users
+            consistently miss things like the reserve / min increment /
+            buy-now caps when they're inline-text. */}
+        <button onClick={() => setShowRules(true)} className="flex flex-col items-center gap-1">
+          <Info size={26} className="text-white" />
+          <span className="text-white text-xs">规则</span>
         </button>
       </div>
 
@@ -378,23 +435,104 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
           )}
         </AnimatePresence>
 
-        {/* Auction ended state */}
+        {/* Outbid alert — flashes when this user's bid was just beaten.
+            Distinct from the global toast: this one sits inline near the
+            bid panel so the "再加价" CTA is one tap away. */}
         <AnimatePresence>
-          {ended && winner && !cancelled && (
+          {outbidAlert && !ended && !cancelled && (
             <motion.div
-              initial={{ opacity: 0, y: 20 }}
+              initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
-              className="mb-3 bg-gradient-to-r from-yellow-500/90 to-orange-500/90 rounded-2xl p-3 flex items-center gap-3"
+              exit={{ opacity: 0, y: -10 }}
+              className="mb-3 bg-gradient-to-r from-red-600 to-rose-700 rounded-2xl p-3 flex items-center gap-3 border border-red-400/50"
             >
-              <Trophy size={28} className="text-white flex-shrink-0" />
-              <div>
-                <div className="text-white font-bold">拍卖结束！</div>
-                <div className="text-white/90 text-sm">
-                  {winner.name ? `🎉 ${winner.name} 以 ¥${winner.price.toFixed(2)} 赢得竞拍` : '无人出价，流拍'}
+              <AlertTriangle size={22} className="text-white flex-shrink-0 animate-pulse" />
+              <div className="flex-1 min-w-0">
+                <div className="text-white font-bold text-sm">你被反超了！</div>
+                <div className="text-white/90 text-xs">
+                  @{outbidAlert.leader} 出价至 ¥{outbidAlert.price.toLocaleString()} — 立即加价
                 </div>
               </div>
+              <button
+                onClick={() => { setShowBidPanel(true); setOutbidAlert(null) }}
+                className="bg-white text-red-600 font-black text-xs px-3 py-1.5 rounded-full flex-shrink-0"
+              >
+                再加价
+              </button>
             </motion.div>
           )}
+        </AnimatePresence>
+
+        {/* Auction ended — distinguishes 4 outcomes for clarity:
+            1. You won (winner_id === me) — gold celebration + 查看订单 CTA
+            2. Someone else won — neutral result line
+            3. Reserve not met (winner_name empty but bid_count > 0) — yellow
+            4. No bids — gray flat-line */}
+        <AnimatePresence>
+          {ended && winner && !cancelled && (() => {
+            const youWon = !!winner.winnerId && winner.winnerId === user?.id
+            const reserveNotMet = !winner.name && auction.bid_count > 0
+            const noBids = !winner.name && auction.bid_count === 0
+
+            if (youWon) {
+              return (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.9 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="mb-3 bg-gradient-to-r from-yellow-400 via-orange-500 to-pink-500 rounded-2xl p-4 text-white"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="text-4xl">🏆</div>
+                    <div className="flex-1">
+                      <div className="font-black text-lg">恭喜中标！</div>
+                      <div className="text-white/90 text-sm">
+                        以 ¥{winner.price.toLocaleString()} 拍下《{auction.product?.title}》
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => navigate('/orders')}
+                    className="w-full mt-3 bg-white text-orange-600 font-black py-2.5 rounded-xl flex items-center justify-center gap-2"
+                  >
+                    <Package size={16} /> 查看订单 / 填写收货地址
+                  </button>
+                </motion.div>
+              )
+            }
+            if (reserveNotMet) {
+              return (
+                <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="mb-3 bg-yellow-500/30 border border-yellow-500/50 rounded-2xl p-3 flex items-center gap-3">
+                  <div className="text-2xl">📉</div>
+                  <div>
+                    <div className="text-yellow-100 font-bold">流拍 — 未达保留价</div>
+                    <div className="text-yellow-100/80 text-xs">最高出价 ¥{winner.price.toLocaleString()}，本次拍卖无人成交</div>
+                  </div>
+                </motion.div>
+              )
+            }
+            if (noBids) {
+              return (
+                <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="mb-3 bg-white/10 rounded-2xl p-3 flex items-center gap-3">
+                  <div className="text-2xl">🌙</div>
+                  <div>
+                    <div className="text-white font-bold">无人出价</div>
+                    <div className="text-white/60 text-xs">本场拍卖结束，没有竞拍者</div>
+                  </div>
+                </motion.div>
+              )
+            }
+            return (
+              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="mb-3 bg-gradient-to-r from-yellow-500/90 to-orange-500/90 rounded-2xl p-3 flex items-center gap-3">
+                <Trophy size={28} className="text-white flex-shrink-0" />
+                <div>
+                  <div className="text-white font-bold">拍卖结束</div>
+                  <div className="text-white/90 text-sm">
+                    🎉 @{winner.name} 以 ¥{winner.price.toLocaleString()} 赢得竞拍
+                  </div>
+                </div>
+              </motion.div>
+            )
+          })()}
         </AnimatePresence>
 
         {/* Bid CTA */}
@@ -462,6 +600,88 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
             )}
           </>
         )}
+      </div>
+
+      {/* Rules drawer — slides up from the bottom. Lives at the root of
+          the component so it overlays all other content (z-50). The
+          backdrop click and the close button both dismiss; we trap the
+          inner click so tapping the drawer body doesn't dismiss. */}
+      <AnimatePresence>
+        {showRules && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setShowRules(false)}
+            className="absolute inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-end"
+          >
+            <motion.div
+              initial={{ y: '100%' }}
+              animate={{ y: 0 }}
+              exit={{ y: '100%' }}
+              transition={{ type: 'spring', damping: 28 }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-full bg-brand-dark border-t border-white/10 rounded-t-3xl p-5 pb-8"
+            >
+              <div className="w-12 h-1 bg-white/20 rounded-full mx-auto mb-4" />
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="font-black text-lg flex items-center gap-2"><Info size={18} /> 竞拍规则</h3>
+                <button onClick={() => setShowRules(false)} className="text-white/50 px-2">关闭</button>
+              </div>
+
+              <div className="space-y-2.5">
+                <RuleRow label="起拍价"  value={auction.start_price === 0 ? '⚡ 0元起拍' : `¥${auction.start_price.toLocaleString()}`} highlight={auction.start_price === 0} />
+                <RuleRow label="加价幅度" value={`+¥${auction.min_increment} / 次`} />
+                {auction.has_reserve && (
+                  <RuleRow
+                    label="保留价"
+                    value={`¥${auction.reserve_price.toLocaleString()}`}
+                    sub="未达保留价时拍卖流拍，无人成交"
+                    highlight
+                  />
+                )}
+                {auction.has_buy_now && (
+                  <RuleRow
+                    label="封顶价"
+                    value={`¥${auction.buy_now_price.toLocaleString()}`}
+                    sub="出价达到此值立即结拍并成交"
+                    highlight
+                  />
+                )}
+                <RuleRow
+                  label="竞拍时长"
+                  value={(() => {
+                    const d = auction.duration
+                    if (d >= 3600) return `${Math.floor(d / 3600)} 小时${d % 3600 ? ` ${Math.floor((d % 3600) / 60)} 分` : ''}`
+                    if (d >= 60) return `${Math.floor(d / 60)} 分钟`
+                    return `${d} 秒`
+                  })()}
+                />
+                <RuleRow label="商品分类" value={auction.product?.category || '—'} />
+                <RuleRow label="卖家" value={`@${auction.seller?.username ?? '—'}`} />
+              </div>
+
+              <div className="mt-4 bg-white/5 rounded-xl p-3 text-xs text-white/60 leading-relaxed">
+                <div className="text-white/80 font-bold mb-1">温馨提示</div>
+                · 出价后无法撤回，请确认金额无误<br />
+                · 中标后货款已托管，确认收货后释放给卖家<br />
+                · 竞拍结束前可被其他买家反超，请关注通知
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}
+
+function RuleRow({ label, value, sub, highlight }: { label: string; value: string; sub?: string; highlight?: boolean }) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="text-white/60 text-sm flex-shrink-0">{label}</div>
+      <div className="text-right">
+        <div className={`font-bold text-sm ${highlight ? 'text-yellow-400' : 'text-white'}`}>{value}</div>
+        {sub && <div className="text-white/40 text-xs mt-0.5">{sub}</div>}
       </div>
     </div>
   )
