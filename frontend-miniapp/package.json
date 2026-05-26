@@ -1,0 +1,36 @@
+{
+  "name": "auction-miniapp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "拍卖直播 — 微信小程序 / H5 多端 (基于 Taro)",
+  "scripts": {
+    "dev:weapp": "taro build --type weapp --watch",
+    "dev:h5":    "taro build --type h5 --watch",
+    "build:weapp": "taro build --type weapp",
+    "build:h5":    "taro build --type h5"
+  },
+  "dependencies": {
+    "@babel/runtime": "^7.21.5",
+    "@tarojs/components": "3.6.21",
+    "@tarojs/helper": "3.6.21",
+    "@tarojs/plugin-framework-react": "3.6.21",
+    "@tarojs/plugin-platform-h5": "3.6.21",
+    "@tarojs/plugin-platform-weapp": "3.6.21",
+    "@tarojs/react": "3.6.21",
+    "@tarojs/runtime": "3.6.21",
+    "@tarojs/shared": "3.6.21",
+    "@tarojs/taro": "3.6.21",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.21.0",
+    "@tarojs/cli": "3.6.21",
+    "@tarojs/webpack5-runner": "3.6.21",
+    "@types/react": "^18.2.43",
+    "@types/webpack-env": "^1.13.6",
+    "babel-preset-taro": "3.6.21",
+    "react-refresh": "^0.14.0",
+    "typescript": "^5.2.2"
+  }
+}

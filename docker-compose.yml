@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: auction_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: auction_root_2024
+      MYSQL_DATABASE: auction_db
+      MYSQL_USER: auction_user
+      MYSQL_PASSWORD: auction_pass_2024
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pauction_root_2024"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: auction_redis
+    ports:
+      - "6379:6379"
+    # appendonly off: we use Redis purely as a cache + pub/sub.
+    # On crash, rankings/view_counter are reconstructed from MySQL (the
+    # source of truth) on the first cold read.
+    command: redis-server --appendonly no --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: auction_backend
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: auction_user
+      DB_PASSWORD: auction_pass_2024
+      DB_NAME: auction_db
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: auction_super_secret_jwt_2024
+      PORT: 8080
+      GIN_MODE: release
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: auction_frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  mysql_data:

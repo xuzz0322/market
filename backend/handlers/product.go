@@ -1,0 +1,183 @@
+package handlers
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+
+	"market/models"
+)
+
+type ProductHandler struct {
+	db *gorm.DB
+}
+
+func NewProductHandler(db *gorm.DB) *ProductHandler {
+	return &ProductHandler{db: db}
+}
+
+type CreateProductRequest struct {
+	Title       string `json:"title" binding:"required,max=200"`
+	Description string `json:"description"`
+	Images      string `json:"images"` // JSON array of URLs
+	VideoURL    string `json:"video_url"`
+	Category    string `json:"category"`
+}
+
+func (h *ProductHandler) Create(c *gin.Context) {
+	userID := c.GetUint("userID")
+
+	var req CreateProductRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	product := models.Product{
+		SellerID:    userID,
+		Title:       req.Title,
+		Description: req.Description,
+		Images:      req.Images,
+		VideoURL:    req.VideoURL,
+		Category:    req.Category,
+		Status:      models.ProductActive,
+	}
+
+	if err := h.db.Create(&product).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create product"})
+		return
+	}
+
+	h.db.Preload("Seller").First(&product, product.ID)
+	c.JSON(http.StatusCreated, product)
+}
+
+func (h *ProductHandler) List(c *gin.Context) {
+	var products []models.Product
+	query := h.db.Preload("Seller").Order("created_at DESC")
+
+	category := c.Query("category")
+	if category != "" {
+		query = query.Where("category = ?", category)
+	}
+
+	status := c.Query("status")
+	if status != "" {
+		query = query.Where("status = ?", status)
+	}
+
+	// My products
+	if c.Query("mine") == "true" {
+		userID := c.GetUint("userID")
+		query = query.Where("seller_id = ?", userID)
+	}
+
+	if err := query.Find(&products).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch products"})
+		return
+	}
+
+	c.JSON(http.StatusOK, products)
+}
+
+func (h *ProductHandler) Get(c *gin.Context) {
+	id := c.Param("id")
+	var product models.Product
+	if err := h.db.Preload("Seller").First(&product, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "product not found"})
+		return
+	}
+	c.JSON(http.StatusOK, product)
+}
+
+type UpdateProductRequest struct {
+	Title       *string `json:"title"`
+	Description *string `json:"description"`
+	Images      *string `json:"images"`
+	VideoURL    *string `json:"video_url"`
+	Category    *string `json:"category"`
+	Status      *string `json:"status"` // "draft" or "active" only — others are state-machine transitions
+}
+
+// Update edits a product. Only allowed when not currently in an auction
+// (otherwise mid-auction edits would let sellers bait-and-switch). Uses
+// pointer fields so unset fields don't clobber existing values.
+func (h *ProductHandler) Update(c *gin.Context) {
+	userID := c.GetUint("userID")
+	id := c.Param("id")
+
+	var req UpdateProductRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var product models.Product
+	if err := h.db.Where("id = ? AND seller_id = ?", id, userID).First(&product).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "product not found"})
+		return
+	}
+	if product.Status == models.ProductAuction {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot edit a product currently in auction"})
+		return
+	}
+
+	updates := map[string]interface{}{}
+	if req.Title != nil       { updates["title"] = *req.Title }
+	if req.Description != nil { updates["description"] = *req.Description }
+	if req.Images != nil      { updates["images"] = *req.Images }
+	if req.VideoURL != nil    { updates["video_url"] = *req.VideoURL }
+	if req.Category != nil    { updates["category"] = *req.Category }
+	if req.Status != nil {
+		// Only let sellers toggle between draft (off-shelf) and active
+		// (on-shelf). Auctioning/sold/ended are state-machine outputs,
+		// not user choices.
+		s := models.ProductStatus(*req.Status)
+		if s != models.ProductDraft && s != models.ProductActive {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "status must be 'draft' or 'active'"})
+			return
+		}
+		updates["status"] = s
+	}
+
+	if err := h.db.Model(&product).Updates(updates).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update"})
+		return
+	}
+	h.db.Preload("Seller").First(&product, product.ID)
+	c.JSON(http.StatusOK, product)
+}
+
+// Delete soft-deletes a product. Refused if any auction (active or
+// historical) references it — historical references matter because we
+// still want to render the product details on past order pages.
+func (h *ProductHandler) Delete(c *gin.Context) {
+	userID := c.GetUint("userID")
+	id := c.Param("id")
+
+	var product models.Product
+	if err := h.db.Where("id = ? AND seller_id = ?", id, userID).First(&product).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "product not found"})
+		return
+	}
+	if product.Status == models.ProductAuction {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete a product currently in auction"})
+		return
+	}
+
+	var count int64
+	h.db.Model(&models.Auction{}).Where("product_id = ?", product.ID).Count(&count)
+	if count > 0 {
+		// Has historical auctions — refuse hard delete; offer status=draft
+		// as the equivalent "hide from listings" path.
+		c.JSON(http.StatusBadRequest, gin.H{"error": "product has historical auctions; set status to 'draft' to hide instead"})
+		return
+	}
+
+	if err := h.db.Delete(&product).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete"})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}

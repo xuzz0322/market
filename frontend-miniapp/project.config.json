@@ -1,0 +1,14 @@
+{
+  "miniprogramRoot": "dist/",
+  "projectname": "auction-miniapp",
+  "description": "拍卖直播间小程序",
+  "appid": "wx0000000000000000",
+  "setting": {
+    "es6": false,
+    "postcss": false,
+    "minified": false,
+    "newFeature": true,
+    "ignoreUploadUnusedFiles": true
+  },
+  "compileType": "miniprogram"
+}

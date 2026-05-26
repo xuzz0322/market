@@ -1,0 +1,71 @@
+.feed {
+  padding: 24rpx;
+  background: #161823;
+  min-height: 100vh;
+  box-sizing: border-box;
+}
+.empty {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255,255,255,0.4);
+  &__emoji { font-size: 96rpx; display: block; }
+  &__text  { font-size: 28rpx; margin-top: 24rpx; display: block; }
+}
+
+.card {
+  position: relative;
+  height: 480rpx;
+  border-radius: 24rpx;
+  overflow: hidden;
+  margin-bottom: 24rpx;
+
+  &__cover { position: absolute; inset: 0; width: 100%; height: 100%; }
+  &__overlay {
+    position: absolute; inset: 0;
+    background: linear-gradient(to top, rgba(0,0,0,0.85) 0%, transparent 60%);
+  }
+
+  &__top {
+    position: absolute; top: 24rpx; left: 24rpx;
+    display: flex; gap: 12rpx;
+  }
+  &__live {
+    background: #FE2C55; color: #fff;
+    font-size: 22rpx; font-weight: 700;
+    padding: 4rpx 16rpx; border-radius: 999px;
+  }
+  &__urgent {
+    background: #b91c1c; color: #fff;
+    font-size: 22rpx; font-weight: 700;
+    padding: 4rpx 16rpx; border-radius: 999px;
+  }
+
+  &__bottom {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    padding: 24rpx;
+  }
+  &__title {
+    color: #fff; font-size: 32rpx; font-weight: 800;
+    display: block; margin-bottom: 16rpx;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  &__row { display: flex; gap: 16rpx; }
+  &__price, &__bidcount, &__timer {
+    background: rgba(0,0,0,0.5);
+    border-radius: 16rpx;
+    padding: 12rpx 18rpx;
+  }
+  &__price-label {
+    display: block;
+    color: rgba(255,255,255,0.6); font-size: 20rpx;
+  }
+  &__price-value {
+    display: block;
+    color: #fff; font-size: 30rpx; font-weight: 800;
+    margin-top: 4rpx;
+  }
+  &__timer--urgent &__price-value { color: #FE2C55; }
+}

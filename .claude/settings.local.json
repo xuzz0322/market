@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go mod *)",
+      "Bash(go env *)",
+      "Bash(GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct GONOSUMDB=\"*\" GOFLAGS=\"-mod=mod\" go mod tidy)"
+    ]
+  }
+}
