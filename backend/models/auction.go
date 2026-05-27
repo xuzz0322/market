@@ -34,6 +34,13 @@ type Auction struct {
 	ReservePrice  float64       `json:"reserve_price" gorm:"type:decimal(12,2);comment:'auction does not transact below this'"`
 	HasBuyNow     bool          `json:"has_buy_now" gorm:"default:false;comment:'whether buy-now/cap price is enabled'"`
 	BuyNowPrice   float64       `json:"buy_now_price" gorm:"type:decimal(12,2)"`
+	// RequiresDeposit gates bidding behind an up-front earnest payment.
+	// When true, every prospective bidder must pay DepositAmount once
+	// (per auction) before their first bid. The deposit is held in escrow
+	// and either applied to the final payment (if they win) or refunded
+	// (loss / auction cancelled / reserve not met).
+	RequiresDeposit bool        `json:"requires_deposit" gorm:"default:false"`
+	DepositAmount   float64     `json:"deposit_amount" gorm:"type:decimal(12,2);default:0;comment:'fixed earnest payment'"`
 	Duration      int           `json:"duration" gorm:"not null;comment:'seconds'"`
 	StartTime     *time.Time    `json:"start_time"`
 	EndTime       *time.Time    `json:"end_time"`

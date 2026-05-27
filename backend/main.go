@@ -96,6 +96,7 @@ func main() {
 	orderH := handlers.NewOrderHandler(db)
 	roomH := handlers.NewRoomHandler(db, auctionSvc)
 	socialH := handlers.NewSocialHandler(db, hub)
+	depositH := handlers.NewDepositHandler(db)
 
 	api := r.Group("/api")
 	{
@@ -113,6 +114,7 @@ func main() {
 
 			auth.POST("/products", productH.Create)
 			auth.GET("/products", productH.List)
+			auth.GET("/products/recommended", productH.Recommended)
 			auth.GET("/products/:id", productH.Get)
 			auth.PATCH("/products/:id", productH.Update)
 			auth.DELETE("/products/:id", productH.Delete)
@@ -145,6 +147,16 @@ func main() {
 			auth.GET("/users/:id/follow", socialH.FollowState)
 			auth.POST("/users/:id/follow", socialH.Follow)
 			auth.DELETE("/users/:id/follow", socialH.Unfollow)
+
+			// Auction deposits — earnest payment users put down before
+			// being allowed to bid on a deposit-gated auction.
+			auth.GET("/me/deposits", depositH.MyDeposits)
+			auth.GET("/auctions/:id/deposit", depositH.GetMyDepositForAuction)
+			auth.POST("/auctions/:id/deposit", depositH.PayDeposit)
+			auth.DELETE("/auctions/:id/deposit", depositH.WithdrawDeposit)
+
+			// Credit score — current value + change history.
+			auth.GET("/me/credit", socialH.MyCredit)
 
 			// Bid endpoint gets a dedicated, tighter limiter.
 			auth.POST("/auctions/:id/bids", bidLimiter.Middleware(), bidH.PlaceBid)
@@ -235,6 +247,8 @@ func autoMigrate(db *gorm.DB) {
 		&models.Order{},
 		&models.Favorite{},
 		&models.Follow{},
+		&models.Deposit{},
+		&models.CreditEvent{},
 	); err != nil {
 		log.Fatal("AutoMigrate failed:", err)
 	}

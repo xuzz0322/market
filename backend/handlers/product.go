@@ -190,6 +190,128 @@ func (h *ProductHandler) Search(c *gin.Context) {
 	})
 }
 
+// Recommended returns products the user is likely interested in. Used as
+// the empty-state for product search ("found nothing → here's what you
+// might like instead") and as a generic discovery feed.
+//
+// Signal mix:
+//   1. Categories the user has previously bid on (strongest interest signal).
+//   2. Categories the user has favorited (medium — bookmarked but not paid).
+//   3. Cold-start fallback: currently-auctioning products by recency.
+//
+// Result is deduplicated by product ID and capped to `limit`. Degrades
+// gracefully — if personalization queries return nothing, we still return
+// discovery content rather than an empty list.
+func (h *ProductHandler) Recommended(c *gin.Context) {
+	userID := c.GetUint("userID")
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	if limit <= 0 || limit > 30 {
+		limit = 12
+	}
+
+	// Categories from bid + favorite history. UNION DISTINCT so a single
+	// hot category doesn't dominate when the user has both bid on and
+	// favorited it.
+	var categories []string
+	h.db.Raw(`
+		SELECT DISTINCT category FROM (
+		    SELECT p.category AS category
+		    FROM bids b
+		    JOIN auctions a ON b.auction_id = a.id
+		    JOIN products p ON a.product_id = p.id
+		    WHERE b.user_id = ? AND p.category != ''
+		    UNION
+		    SELECT p.category AS category
+		    FROM favorites f
+		    JOIN auctions a ON f.auction_id = a.id
+		    JOIN products p ON a.product_id = p.id
+		    WHERE f.user_id = ? AND p.category != ''
+		) t
+	`, userID, userID).Scan(&categories)
+
+	type out struct {
+		models.Product
+		AuctionID uint `json:"auction_id,omitempty"`
+	}
+
+	var products []models.Product
+	if len(categories) > 0 {
+		// Personalized path: pull active inventory matching the user's
+		// inferred interest categories.
+		h.db.Model(&models.Product{}).
+			Where("status IN ? AND category IN ?",
+				[]models.ProductStatus{models.ProductActive, models.ProductAuction},
+				categories,
+			).
+			Preload("Seller").
+			Order("created_at DESC").
+			Limit(limit).
+			Find(&products)
+	}
+
+	// Cold-start / top-up: if personalization didn't fill the quota,
+	// pad with currently-auctioning products. We exclude already-seen
+	// IDs so the same product doesn't appear twice.
+	if len(products) < limit {
+		seen := make(map[uint]bool, len(products))
+		for _, p := range products {
+			seen[p.ID] = true
+		}
+		excludeIDs := make([]uint, 0, len(seen))
+		for id := range seen {
+			excludeIDs = append(excludeIDs, id)
+		}
+
+		need := limit - len(products)
+		var more []models.Product
+		query := h.db.Model(&models.Product{}).
+			Where("status = ?", models.ProductAuction).
+			Preload("Seller").
+			Order("created_at DESC").
+			Limit(need)
+		if len(excludeIDs) > 0 {
+			query = query.Where("id NOT IN ?", excludeIDs)
+		}
+		query.Find(&more)
+		products = append(products, more...)
+	}
+
+	// Hydrate auction_id for products currently in auction so the result
+	// cards can deep-link straight into the bid room (mirrors the search
+	// endpoint's contract).
+	auctionByProduct := make(map[uint]uint)
+	if len(products) > 0 {
+		productIDs := make([]uint, 0, len(products))
+		for _, p := range products {
+			if p.Status == models.ProductAuction {
+				productIDs = append(productIDs, p.ID)
+			}
+		}
+		if len(productIDs) > 0 {
+			type row struct {
+				ProductID uint
+				ID        uint
+			}
+			var rows []row
+			h.db.Model(&models.Auction{}).
+				Select("product_id, id").
+				Where("product_id IN ? AND status IN ?", productIDs, []models.AuctionStatus{
+					models.AuctionPending, models.AuctionActive,
+				}).
+				Scan(&rows)
+			for _, r := range rows {
+				auctionByProduct[r.ProductID] = r.ID
+			}
+		}
+	}
+
+	result := make([]out, len(products))
+	for i, p := range products {
+		result[i] = out{Product: p, AuctionID: auctionByProduct[p.ID]}
+	}
+	c.JSON(http.StatusOK, result)
+}
+
 func (h *ProductHandler) Get(c *gin.Context) {
 	id := c.Param("id")
 	var product models.Product

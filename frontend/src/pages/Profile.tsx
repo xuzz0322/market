@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import toast from 'react-hot-toast'
-import { Trophy, Package, ChevronRight, LogOut, Wallet, X, AlertTriangle, Heart } from 'lucide-react'
+import { Trophy, Package, ChevronRight, LogOut, Wallet, X, AlertTriangle, Heart, ShieldCheck, ShieldAlert } from 'lucide-react'
 import { getMe, listAuctions, startAuction, cancelAuction } from '../services/api'
 import { useAuthStore } from '../services/store'
 import type { Auction } from '../types'
@@ -111,6 +111,39 @@ export default function Profile() {
             ¥{(user?.balance ?? 0).toLocaleString('zh-CN', { minimumFractionDigits: 2 })}
           </div>
         </div>
+
+        {/* Credit chip — concise score + tap-through to detail page. The
+            color band mirrors the Credit page's banding (red/yellow/green)
+            so users build a consistent mental model. */}
+        {(() => {
+          const score = user?.credit_score ?? 100
+          const tooLow = score < 60
+          const okay = score >= 100
+          const colors = tooLow
+            ? { bg: 'bg-red-500/20', border: 'border-red-500/40', text: 'text-red-300', icon: 'text-red-400' }
+            : okay
+              ? { bg: 'bg-emerald-500/15', border: 'border-emerald-500/30', text: 'text-emerald-300', icon: 'text-emerald-400' }
+              : { bg: 'bg-yellow-500/15', border: 'border-yellow-500/30', text: 'text-yellow-300', icon: 'text-yellow-400' }
+          return (
+            <button
+              onClick={() => navigate('/credit')}
+              className={`mt-2 w-full ${colors.bg} ${colors.border} border rounded-2xl p-3 flex items-center gap-3`}
+            >
+              {tooLow
+                ? <ShieldAlert size={18} className={colors.icon} />
+                : <ShieldCheck size={18} className={colors.icon} />}
+              <div className="flex-1 text-left">
+                <div className={`font-bold text-sm ${colors.text}`}>
+                  信用分 <span className="text-base">{score}</span>
+                </div>
+                <div className="text-white/40 text-xs">
+                  {tooLow ? '低于 60，暂时无法参与拍卖' : okay ? '良好，可正常参与拍卖' : '注意维护，避免降至 60 以下'}
+                </div>
+              </div>
+              <ChevronRight size={18} className="text-white/40" />
+            </button>
+          )
+        })()}
       </div>
 
       {/* Quick action — My Orders. Sits above "我的拍卖" because for a

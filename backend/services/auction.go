@@ -108,6 +108,8 @@ func (s *AuctionService) EndAuction(auction *models.Auction) {
 				Update("status", models.BidOutbid)
 			tx.Model(&models.Product{}).Where("id = ?", auction.ProductID).
 				Update("status", models.ProductEnded)
+			// Reserve not met → no winner → everyone gets their deposit back.
+			refundAllHeldDeposits(tx, auction.ID, 0)
 			log.Printf("Auction %d ended — reserve not met (top: %.2f, reserve: %.2f)", auction.ID, topBid.Amount, auction.ReservePrice)
 			tx.Save(auction)
 			tx.Commit()
@@ -141,8 +143,29 @@ func (s *AuctionService) EndAuction(auction *models.Auction) {
 		// here, in the same tx as winner determination, eliminates the
 		// "user wins but lacks balance" race that would otherwise need a
 		// reservation/cancellation flow.
+		//
+		// Deposit handling: if the auction required a deposit, the
+		// winner already paid it earlier — capture only the *difference*
+		// from their balance, and flip their deposit row from "held" to
+		// "applied". Other users' deposits are refunded below.
+		captureAmt := topBid.Amount
+		if auction.RequiresDeposit && auction.DepositAmount > 0 {
+			var winnerDep models.Deposit
+			if err := tx.Where("user_id = ? AND auction_id = ? AND status = ?",
+				topBid.UserID, auction.ID, models.DepositHeld).First(&winnerDep).Error; err == nil {
+				captureAmt = topBid.Amount - winnerDep.Amount
+				if captureAmt < 0 {
+					captureAmt = 0
+				}
+				now := time.Now()
+				tx.Model(&winnerDep).Updates(map[string]interface{}{
+					"status":     models.DepositApplied,
+					"settled_at": &now,
+				})
+			}
+		}
 		tx.Model(&models.User{}).Where("id = ?", topBid.UserID).
-			UpdateColumn("balance", gorm.Expr("balance - ?", topBid.Amount))
+			UpdateColumn("balance", gorm.Expr("balance - ?", captureAmt))
 
 		// Create the order record. Single tx with the auction-finalize so
 		// we never have a "won auction with no order" state visible to
@@ -165,11 +188,19 @@ func (s *AuctionService) EndAuction(auction *models.Auction) {
 		}
 
 		log.Printf("Auction %d ended - winner: user %d, price: %.2f, order: %s", auction.ID, topBid.UserID, topBid.Amount, order.OrderNo)
+
+		// Refund every losing bidder's deposit. The winner's deposit was
+		// flipped to "applied" earlier; this call skips them by user id.
+		refundAllHeldDeposits(tx, auction.ID, topBid.UserID)
 	} else {
 		// No bids, auction ends without winner
 		auction.Status = models.AuctionEnded
 		tx.Model(&models.Product{}).Where("id = ?", auction.ProductID).
 			Update("status", models.ProductEnded)
+		// No bids means no held deposits in practice (deposit is paid before
+		// bidding) but call this anyway to handle the edge case where a user
+		// pre-paid the deposit but never bid.
+		refundAllHeldDeposits(tx, auction.ID, 0)
 		log.Printf("Auction %d ended with no bids", auction.ID)
 	}
 
@@ -513,6 +544,39 @@ func (s *AuctionService) NotifyOutbid(auction *models.Auction, displacedUserIDs 
 	}
 }
 
+// refundAllHeldDeposits credits back every "held" deposit on the given
+// auction (skipping a specific user when skipUserID > 0 — used to skip the
+// winner whose deposit was applied instead of refunded).
+//
+// Best-effort: we do each refund as its own statement rather than a single
+// JOIN-update because the underlying schema's row count is small and the
+// per-row failure surface is easier to reason about. Errors are logged
+// and skipped — leaving a deposit "held" is recoverable (admin can refund
+// manually) whereas double-crediting balance is not.
+func refundAllHeldDeposits(db *gorm.DB, auctionID, skipUserID uint) {
+	var deposits []models.Deposit
+	q := db.Where("auction_id = ? AND status = ?", auctionID, models.DepositHeld)
+	if skipUserID > 0 {
+		q = q.Where("user_id <> ?", skipUserID)
+	}
+	if err := q.Find(&deposits).Error; err != nil {
+		log.Printf("refund deposits (auction %d): query failed: %v", auctionID, err)
+		return
+	}
+	now := time.Now()
+	for _, d := range deposits {
+		if err := db.Model(&models.User{}).Where("id = ?", d.UserID).
+			UpdateColumn("balance", gorm.Expr("balance + ?", d.Amount)).Error; err != nil {
+			log.Printf("refund deposit %d: balance update failed: %v", d.ID, err)
+			continue
+		}
+		db.Model(&d).Updates(map[string]interface{}{
+			"status":     models.DepositRefunded,
+			"settled_at": &now,
+		})
+	}
+}
+
 // StartAuction activates a pending auction
 func (s *AuctionService) StartAuction(auction *models.Auction) error {
 	now := time.Now()
@@ -670,6 +734,21 @@ func (s *AuctionService) CancelAuction(auction *models.Auction, reason string) e
 	s.db.Model(&models.Product{}).
 		Where("id = ?", auction.ProductID).
 		Update("status", models.ProductActive)
+
+	// Refund every held deposit on this auction. Cancellation always
+	// refunds in full — the seller pulled out, no one should be on the
+	// hook for an earnest payment.
+	refundAllHeldDeposits(s.db, auction.ID, 0)
+
+	// Credit penalty — only when the auction had real bidders. Cancelling
+	// a pending no-bid auction is harmless (no one was inconvenienced);
+	// cancelling once people have committed is breach-of-trust and earns
+	// a -5. We don't double-count repeat offenders here; the cumulative
+	// effect comes from doing it many times.
+	if auction.BidCount > 0 {
+		AdjustCredit(s.db, auction.SellerID, -5, models.CreditReasonSellerCancelled,
+			"auction", auction.ID, "活跃拍卖被卖家取消")
+	}
 
 	// Reflect changes on the in-memory copy so the caller can return it.
 	auction.Status = models.AuctionCancelled

@@ -58,6 +58,9 @@ export const searchProducts = (params: {
     '/products/search', { params }
   ).then((r) => r.data)
 
+export const recommendedProducts = (limit = 12) =>
+  api.get<ProductSearchResult[]>('/products/recommended', { params: { limit } }).then((r) => r.data)
+
 // Auctions
 export const createAuction = (data: {
   product_id: number
@@ -65,6 +68,8 @@ export const createAuction = (data: {
   min_increment: number
   has_buy_now: boolean
   buy_now_price?: number
+  requires_deposit?: boolean
+  deposit_amount?: number
   duration: number
 }) => api.post<Auction>('/auctions', data).then((r) => r.data)
 
@@ -155,6 +160,56 @@ export const followUser = (hostId: number) =>
 
 export const unfollowUser = (hostId: number) =>
   api.delete<{ following: boolean }>(`/users/${hostId}/follow`).then((r) => r.data)
+
+// Deposits — earnest payment for deposit-gated auctions.
+export interface DepositState {
+  required: boolean
+  amount: number
+  paid: boolean
+  status?: 'held' | 'refunded' | 'applied'
+}
+
+export const getDepositState = (auctionId: number) =>
+  api.get<DepositState>(`/auctions/${auctionId}/deposit`).then((r) => r.data)
+
+export const payDeposit = (auctionId: number) =>
+  api.post<{ paid: boolean; amount: number }>(`/auctions/${auctionId}/deposit`).then((r) => r.data)
+
+export const withdrawDeposit = (auctionId: number) =>
+  api.delete<{ refunded: boolean }>(`/auctions/${auctionId}/deposit`).then((r) => r.data)
+
+export const myDeposits = () =>
+  api.get<Array<{
+    id: number
+    auction_id: number
+    auction?: Auction
+    amount: number
+    status: 'held' | 'refunded' | 'applied'
+    created_at: string
+    settled_at?: string
+  }>>('/me/deposits').then((r) => r.data)
+
+// Credit
+export interface CreditEvent {
+  id: number
+  user_id: number
+  delta: number
+  after: number
+  reason: string
+  ref_type: string
+  ref_id: number
+  note: string
+  created_at: string
+}
+
+export const myCredit = () =>
+  api.get<{
+    score: number
+    min_to_bid: number
+    max_score: number
+    can_bid: boolean
+    events: CreditEvent[]
+  }>('/me/credit').then((r) => r.data)
 
 // Bids
 export const placeBid = (auctionId: number, amount: number) =>

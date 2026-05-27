@@ -248,6 +248,8 @@ type AddAuctionRequest struct {
 	BuyNowPrice  float64 `json:"buy_now_price"`
 	HasReserve   bool    `json:"has_reserve"`
 	ReservePrice float64 `json:"reserve_price"`
+	RequiresDeposit bool    `json:"requires_deposit"`
+	DepositAmount   float64 `json:"deposit_amount"`
 	Duration     int     `json:"duration" binding:"required,min=60"`
 }
 
@@ -302,6 +304,10 @@ func (h *RoomHandler) AddAuction(c *gin.Context) {
 			return
 		}
 	}
+	if req.RequiresDeposit && req.DepositAmount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "deposit amount must be greater than zero"})
+		return
+	}
 
 	roomID := room.ID
 	auction := models.Auction{
@@ -315,6 +321,8 @@ func (h *RoomHandler) AddAuction(c *gin.Context) {
 		ReservePrice: req.ReservePrice,
 		HasBuyNow:    req.HasBuyNow,
 		BuyNowPrice:  req.BuyNowPrice,
+		RequiresDeposit: req.RequiresDeposit,
+		DepositAmount:   req.DepositAmount,
 		Duration:     req.Duration,
 		Status:       models.AuctionPending,
 	}
@@ -323,6 +331,9 @@ func (h *RoomHandler) AddAuction(c *gin.Context) {
 	}
 	if !auction.HasReserve {
 		auction.ReservePrice = 0
+	}
+	if !auction.RequiresDeposit {
+		auction.DepositAmount = 0
 	}
 
 	if err := h.db.Create(&auction).Error; err != nil {

@@ -110,6 +110,20 @@ func (h *BidHandler) PlaceBid(c *gin.Context) {
 				return &bidValidationError{Code: 400, Msg: "cannot bid on your own auction"}
 			}
 
+			// Deposit gate: if the seller required an earnest payment, block
+			// users who haven't put it down yet. We DON'T deduct balance
+			// here — the deposit is collected via /api/auctions/:id/deposit
+			// before the user opens the bid panel.
+			if auction.RequiresDeposit && auction.DepositAmount > 0 {
+				var depCount int64
+				tx.Model(&models.Deposit{}).
+					Where("user_id = ? AND auction_id = ? AND status = ?", userID, auction.ID, models.DepositHeld).
+					Count(&depCount)
+				if depCount == 0 {
+					return &bidValidationError{Code: 402, Msg: "请先缴纳保证金"}
+				}
+			}
+
 			minBid := auction.CurrentPrice + auction.MinIncrement
 			if auction.BidCount == 0 {
 				minBid = auction.StartPrice
@@ -122,6 +136,13 @@ func (h *BidHandler) PlaceBid(c *gin.Context) {
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 				First(&currentUser, userID).Error; err != nil {
 				return err
+			}
+			// Credit gate. Same threshold as the deposit endpoint so users
+			// don't get blocked unexpectedly mid-flow ("I paid the deposit
+			// but can't bid?"). A 402-ish status would mislead clients into
+			// thinking it's a payment issue, so we use 403.
+			if currentUser.CreditScore < models.CreditMinToBid {
+				return &bidValidationError{Code: 403, Msg: "信用分过低，暂时无法参与拍卖"}
 			}
 			if currentUser.Balance < req.Amount {
 				return &bidValidationError{Code: 400, Msg: "insufficient balance"}

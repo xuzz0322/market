@@ -2,9 +2,9 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import toast from 'react-hot-toast'
-import { ArrowLeft, Eye, Heart, Share2, ChevronUp, Trophy, Zap, Info, Users, AlertTriangle, Package, Sparkles } from 'lucide-react'
+import { ArrowLeft, Eye, Heart, Share2, ChevronUp, Trophy, Zap, Info, Users, AlertTriangle, Package, Sparkles, ShieldCheck } from 'lucide-react'
 import type { Auction, BidRanking, BidUpdateData, AuctionEndData } from '../types'
-import { getAuction, placeBid, getAuctionRecommendations } from '../services/api'
+import { getAuction, placeBid, getAuctionRecommendations, getDepositState, payDeposit, type DepositState } from '../services/api'
 import wsClient from '../services/websocket'
 import { useAuthStore, useFavoritesStore } from '../services/store'
 import CountdownTimer from './CountdownTimer'
@@ -52,6 +52,12 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
   // auction's state changes (not on every other favorite toggle).
   const isFavorited = useFavoritesStore((s) => s.ids.has(auctionId))
   const toggleFavorite = useFavoritesStore((s) => s.toggle)
+
+  // Deposit state — gate that blocks the bid panel when the seller required
+  // an earnest payment. Re-fetched after a successful pay so the UI flips
+  // directly into "you can now bid" mode without a manual refresh.
+  const [depositState, setDepositState] = useState<DepositState | null>(null)
+  const [payingDeposit, setPayingDeposit] = useState(false)
   // Recommendations shown after the auction ends. Lazy-loaded once the
   // first end/cancel event fires so we don't pay the request cost during
   // the live bidding phase.
@@ -217,6 +223,33 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
       if (w.__auctionFocus === auctionId) w.__auctionFocus = undefined
     }
   }, [auctionId])
+
+  // Pull the user's deposit status once auction info is loaded. Skipped
+  // when the user is the seller (sellers can't bid → can't deposit).
+  useEffect(() => {
+    if (!auction || !user) return
+    if (user.id === auction.seller_id) return
+    if (!auction.requires_deposit) {
+      setDepositState({ required: false, amount: 0, paid: false })
+      return
+    }
+    getDepositState(auctionId).then(setDepositState).catch(() => {})
+  }, [auction, user, auctionId])
+
+  const handlePayDeposit = async () => {
+    if (!depositState) return
+    setPayingDeposit(true)
+    try {
+      await payDeposit(auctionId)
+      setDepositState({ ...depositState, paid: true, status: 'held' })
+      toast.success(`已缴纳保证金 ¥${depositState.amount}，可以出价啦`)
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? '缴纳失败'
+      toast.error(msg)
+    } finally {
+      setPayingDeposit(false)
+    }
+  }
 
   // Once the auction terminates (ended or cancelled), pull recommendations
   // and surface the overlay. We load lazily — there's no value in fetching
@@ -608,7 +641,22 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
         {/* Bid CTA */}
         {auction.status === 'active' && !ended && !cancelled && user?.id !== auction.seller_id && (
           <>
-            {!showBidPanel ? (
+            {/* Deposit gate — when the seller required earnest, replace
+                the bid CTA with a "缴纳保证金" button. After payment, the
+                UI flips back to the normal bid flow on the next render. */}
+            {depositState?.required && !depositState.paid ? (
+              <motion.button
+                whileTap={{ scale: 0.96 }}
+                onClick={handlePayDeposit}
+                disabled={payingDeposit}
+                className="w-full bg-gradient-to-r from-cyan-500 to-blue-500 text-white font-black text-base py-3.5 rounded-2xl flex items-center justify-center gap-2 disabled:opacity-50"
+              >
+                <ShieldCheck size={18} />
+                {payingDeposit
+                  ? '缴纳中...'
+                  : `缴纳保证金 ¥${depositState.amount} 后出价`}
+              </motion.button>
+            ) : !showBidPanel ? (
               <motion.button
                 whileTap={{ scale: 0.96 }}
                 onClick={() => setShowBidPanel(true)}
@@ -788,6 +836,14 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
                     label="封顶价"
                     value={`¥${auction.buy_now_price.toLocaleString()}`}
                     sub="出价达到此值立即结拍并成交"
+                    highlight
+                  />
+                )}
+                {auction.requires_deposit && auction.deposit_amount > 0 && (
+                  <RuleRow
+                    label="保证金"
+                    value={`¥${auction.deposit_amount.toLocaleString()}`}
+                    sub="出价前需缴纳，未中标全额退回；中标抵扣最终成交价"
                     highlight
                   />
                 )}

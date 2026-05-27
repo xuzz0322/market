@@ -188,6 +188,32 @@ func (h *SocialHandler) FollowState(c *gin.Context) {
 	})
 }
 
+// ---------- Credit ----------
+
+// MyCredit returns the caller's score, the participation threshold, and
+// recent change log. Single endpoint — the UI for credit is small enough
+// that a dedicated /history call would just be extra round-trips.
+func (h *SocialHandler) MyCredit(c *gin.Context) {
+	userID := c.GetUint("userID")
+	var u models.User
+	if err := h.db.Select("id, credit_score").First(&u, userID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+	var events []models.CreditEvent
+	h.db.Where("user_id = ?", userID).
+		Order("created_at DESC").
+		Limit(50).
+		Find(&events)
+	c.JSON(http.StatusOK, gin.H{
+		"score":         u.CreditScore,
+		"min_to_bid":    models.CreditMinToBid,
+		"max_score":     models.CreditMaxScore,
+		"can_bid":       u.CreditScore >= models.CreditMinToBid,
+		"events":        events,
+	})
+}
+
 // ---------- Helpers ----------
 
 func isDuplicate(err error) bool {

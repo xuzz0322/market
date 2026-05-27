@@ -4,6 +4,7 @@ export interface User {
   email: string
   avatar: string
   balance: number
+  credit_score: number
   created_at: string
 }
 
@@ -34,6 +35,8 @@ export interface Auction {
   reserve_price: number
   has_buy_now: boolean
   buy_now_price: number
+  requires_deposit: boolean
+  deposit_amount: number
   duration: number
   start_time?: string
   end_time?: string

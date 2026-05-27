@@ -9,6 +9,7 @@ import (
 	"gorm.io/gorm"
 
 	"market/models"
+	"market/services"
 )
 
 type OrderHandler struct {
@@ -136,6 +137,13 @@ func (h *OrderHandler) Confirm(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to release funds"})
 		return
 	}
+
+	// Credit rewards on a successful transaction. Both buyer and seller
+	// earn — a clean order benefits everyone, and tying credit only to
+	// buyers would push sellers' scores below the threshold over time
+	// from cancellations alone.
+	services.AdjustCredit(tx, order.BuyerID, +5, models.CreditReasonOrderCompleted, "order", order.ID, "确认收货")
+	services.AdjustCredit(tx, order.SellerID, +3, models.CreditReasonOrderCompleted, "order", order.ID, "订单成交完成")
 
 	tx.Commit()
 	h.db.First(&order, order.ID)

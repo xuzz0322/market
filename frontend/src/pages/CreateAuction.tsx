@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import toast from 'react-hot-toast'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Package, Clock, DollarSign, TrendingUp, Crown, Zap } from 'lucide-react'
+import { Package, Clock, DollarSign, TrendingUp, Crown, Zap, ShieldCheck } from 'lucide-react'
 import { createProduct, createAuction, startAuction } from '../services/api'
 
 export default function CreateAuction() {
@@ -23,6 +23,8 @@ export default function CreateAuction() {
   const [minIncrement, setMinIncrement] = useState('10')
   const [hasBuyNow, setHasBuyNow] = useState(false)
   const [buyNowPrice, setBuyNowPrice] = useState('')
+  const [requiresDeposit, setRequiresDeposit] = useState(false)
+  const [depositAmount, setDepositAmount] = useState('')
   const [duration, setDuration] = useState('300')
   const [autoStart, setAutoStart] = useState(true)
 
@@ -74,6 +76,15 @@ export default function CreateAuction() {
       }
     }
 
+    let dep = 0
+    if (requiresDeposit) {
+      dep = parseFloat(depositAmount)
+      if (isNaN(dep) || dep <= 0) {
+        toast.error('保证金必须大于 0')
+        return
+      }
+    }
+
     setLoading(true)
     try {
       const auction = await createAuction({
@@ -82,6 +93,8 @@ export default function CreateAuction() {
         min_increment: mi,
         has_buy_now: hasBuyNow,
         buy_now_price: hasBuyNow ? bnp : undefined,
+        requires_deposit: requiresDeposit,
+        deposit_amount: requiresDeposit ? dep : undefined,
         duration: d,
       })
 
@@ -307,6 +320,49 @@ export default function CreateAuction() {
             </div>
 
             <div className="bg-white/5 rounded-2xl p-4 space-y-3">
+              <label className="flex items-center justify-between cursor-pointer">
+                <div className="flex items-center gap-2">
+                  <ShieldCheck size={18} className="text-cyan-400" />
+                  <div>
+                    <div className="text-white font-bold">要求出价者缴纳保证金</div>
+                    <div className="text-white/40 text-xs">出价前先冻结一笔金额，结拍时退还/抵扣</div>
+                  </div>
+                </div>
+                <div
+                  onClick={() => setRequiresDeposit(!requiresDeposit)}
+                  className={`w-12 h-6 rounded-full transition-colors relative flex-shrink-0 ${requiresDeposit ? 'bg-cyan-500' : 'bg-white/20'}`}
+                >
+                  <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${requiresDeposit ? 'translate-x-7' : 'translate-x-1'}`} />
+                </div>
+              </label>
+
+              <AnimatePresence initial={false}>
+                {requiresDeposit && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: 'auto', opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    className="overflow-hidden"
+                  >
+                    <label className="text-white/60 text-sm">保证金金额 (¥)</label>
+                    <input
+                      type="number"
+                      value={depositAmount}
+                      onChange={(e) => setDepositAmount(e.target.value)}
+                      placeholder="例如 100"
+                      min={0}
+                      className="w-full bg-white/10 text-white rounded-xl px-3 py-2.5 mt-1 outline-none focus:ring-1 focus:ring-cyan-500"
+                    />
+                    <div className="text-white/40 text-xs mt-2 leading-relaxed">
+                      · 中标者：保证金抵扣最终成交价<br />
+                      · 未中标 / 流拍 / 卖家取消：保证金原路退回
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+
+            <div className="bg-white/5 rounded-2xl p-4 space-y-3">
               <div className="flex items-center gap-2 text-brand-pink font-bold mb-2">
                 <Clock size={18} /> 竞拍时长
               </div>
@@ -358,6 +414,12 @@ export default function CreateAuction() {
                 <span className="text-white/60">封顶价</span>
                 <span className={`font-bold ${hasBuyNow ? 'text-yellow-400' : 'text-white/40'}`}>
                   {hasBuyNow ? `👑 ¥${buyNowPrice || 0}` : '不设置'}
+                </span>
+              </div>
+              <div className="flex justify-between text-sm mt-1">
+                <span className="text-white/60">保证金</span>
+                <span className={`font-bold ${requiresDeposit ? 'text-cyan-400' : 'text-white/40'}`}>
+                  {requiresDeposit ? `🛡 ¥${depositAmount || 0}` : '不设置'}
                 </span>
               </div>
               <div className="flex justify-between text-sm mt-1">

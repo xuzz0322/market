@@ -31,6 +31,8 @@ type CreateAuctionRequest struct {
 	ReservePrice float64 `json:"reserve_price"`
 	HasBuyNow    bool    `json:"has_buy_now"`
 	BuyNowPrice  float64 `json:"buy_now_price"`
+	RequiresDeposit bool    `json:"requires_deposit"`
+	DepositAmount   float64 `json:"deposit_amount"`
 	Duration     int     `json:"duration" binding:"required,min=60"`
 }
 
@@ -85,6 +87,12 @@ func (h *AuctionHandler) Create(c *gin.Context) {
 			return
 		}
 	}
+	// Deposit must be positive when enabled. We don't cap it relative to
+	// start_price — sellers can demand 100%+ as a strong commitment signal.
+	if req.RequiresDeposit && req.DepositAmount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "deposit amount must be greater than zero"})
+		return
+	}
 
 	auction := models.Auction{
 		ProductID:    req.ProductID,
@@ -96,6 +104,8 @@ func (h *AuctionHandler) Create(c *gin.Context) {
 		ReservePrice: req.ReservePrice,
 		HasBuyNow:    req.HasBuyNow,
 		BuyNowPrice:  req.BuyNowPrice,
+		RequiresDeposit: req.RequiresDeposit,
+		DepositAmount:   req.DepositAmount,
 		Duration:     req.Duration,
 		Status:       models.AuctionPending,
 	}
@@ -108,6 +118,9 @@ func (h *AuctionHandler) Create(c *gin.Context) {
 	}
 	if !auction.HasReserve {
 		auction.ReservePrice = 0
+	}
+	if !auction.RequiresDeposit {
+		auction.DepositAmount = 0
 	}
 
 	if err := h.db.Create(&auction).Error; err != nil {

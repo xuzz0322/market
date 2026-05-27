@@ -39,7 +39,22 @@ type User struct {
 	Avatar    string         `json:"avatar" gorm:"size:500"`
 	Balance   float64        `json:"balance" gorm:"type:decimal(12,2);default:10000"`
 	Role      UserRole       `json:"role" gorm:"type:varchar(20);default:'user';index"`
+	// CreditScore gates auction participation. New users start at 100.
+	// Failure modes (seller cancels live auction, buyer abandons order)
+	// shave points; positive milestones (completed orders) restore them.
+	// Below CreditMinToBid, the user can browse but is blocked from
+	// paying deposits or placing bids.
+	CreditScore int            `json:"credit_score" gorm:"default:100"`
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
 }
+
+// CreditMinToBid is the floor for auction participation. Picked at 60 so a
+// single seller-cancel (-5) or one bad order (-10) doesn't immediately lock
+// the user out, but a pattern of bad behavior eventually does. Tunable.
+const CreditMinToBid = 60
+
+// CreditMaxScore caps the upward drift from positive events so that a user
+// can't bank arbitrary credit and become "untouchable" by future penalties.
+const CreditMaxScore = 150

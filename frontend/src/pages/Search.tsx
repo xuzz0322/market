@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion } from 'framer-motion'
-import { ArrowLeft, Search as SearchIcon, X, Tag, Zap } from 'lucide-react'
-import { searchProducts, type ProductSearchResult } from '../services/api'
+import { ArrowLeft, Search as SearchIcon, X, Tag, Zap, Sparkles } from 'lucide-react'
+import { searchProducts, recommendedProducts, type ProductSearchResult } from '../services/api'
 
 const QUICK_CATEGORIES = ['手办', '潮玩', '数码', '球鞋', '腕表', '珠宝', '艺术品', '其他']
 
@@ -14,6 +14,10 @@ export default function Search() {
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [searched, setSearched] = useState(false)
+  // Recommendations shown when the search yields zero hits — pulled lazily
+  // so we don't burn an API call until we actually need to display them.
+  const [recommendations, setRecommendations] = useState<ProductSearchResult[]>([])
+  const [recsLoading, setRecsLoading] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const debounceRef = useRef<number | undefined>(undefined)
 
@@ -47,6 +51,20 @@ export default function Search() {
   useEffect(() => {
     inputRef.current?.focus()
   }, [])
+
+  // Lazy-load recommendations the first time we hit a zero-result search.
+  // We don't eagerly fetch on mount because most searches succeed; spending
+  // a request up-front would be wasteful. Subsequent zero-result searches
+  // reuse the cached list.
+  useEffect(() => {
+    if (!searched || loading || results.length > 0) return
+    if (recommendations.length > 0 || recsLoading) return
+    setRecsLoading(true)
+    recommendedProducts(12)
+      .then(setRecommendations)
+      .catch(() => { /* silent — empty state is still graceful */ })
+      .finally(() => setRecsLoading(false))
+  }, [searched, loading, results.length, recommendations.length, recsLoading])
 
   const parseImages = (s: string): string[] => {
     try { return JSON.parse(s) || [] } catch { return s ? [s] : [] }
@@ -121,53 +139,83 @@ export default function Search() {
       )}
 
       {!loading && searched && results.length === 0 && (
-        <div className="px-6 py-20 text-center">
-          <div className="text-5xl mb-3">🔍</div>
-          <div className="text-white/60">没有找到相关商品</div>
-          <div className="text-white/30 text-xs mt-1">换个关键词或者类目试试</div>
+        <div className="px-3">
+          <div className="px-3 py-10 text-center">
+            <div className="text-5xl mb-3">🔍</div>
+            <div className="text-white/60">没有找到相关商品</div>
+            <div className="text-white/30 text-xs mt-1">不如看看下面这些…</div>
+          </div>
+
+          {/* Empty-state recommendations — server picks based on the user's
+              bid + favorite history, falls back to live auctions. Renders
+              with the same card grid as actual search results so the
+              transition feels seamless. */}
+          {recsLoading ? (
+            <div className="py-8 flex justify-center">
+              <div className="w-6 h-6 border-2 border-brand-pink border-t-transparent rounded-full animate-spin" />
+            </div>
+          ) : recommendations.length > 0 ? (
+            <>
+              <div className="flex items-center gap-1.5 text-white/70 text-sm font-bold px-1 mb-2">
+                <Sparkles size={14} className="text-yellow-400" /> 猜你感兴趣
+              </div>
+              <ResultGrid items={recommendations} onItemClick={onResultClick} />
+            </>
+          ) : null}
         </div>
       )}
 
       {!loading && results.length > 0 && (
         <>
           <div className="px-3 text-white/40 text-xs mb-2">共 {total} 件商品</div>
-          <div className="grid grid-cols-2 gap-2 px-3">
-            {results.map((p) => {
-              const images = parseImages(p.images)
-              const cover = images[0] || `https://picsum.photos/seed/p${p.id}/400/400`
-              return (
-                <motion.div
-                  key={p.id}
-                  whileTap={{ scale: 0.97 }}
-                  onClick={() => onResultClick(p)}
-                  className={`relative bg-white/5 rounded-xl overflow-hidden ${p.auction_id ? 'cursor-pointer' : 'cursor-default'}`}
-                >
-                  <div className="relative aspect-[4/5]">
-                    <img src={cover} alt={p.title} className="w-full h-full object-cover" loading="lazy" />
-                    {p.auction_id && (
-                      <span className="absolute top-1.5 left-1.5 bg-brand-pink text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full flex items-center gap-0.5">
-                        <Zap size={10} /> 拍卖中
-                      </span>
-                    )}
-                    {p.status === 'active' && !p.auction_id && (
-                      <span className="absolute top-1.5 left-1.5 bg-white/20 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">
-                        待开拍
-                      </span>
-                    )}
-                  </div>
-                  <div className="p-2">
-                    <div className="text-white text-sm font-bold line-clamp-1">{p.title}</div>
-                    <div className="flex items-center justify-between mt-1">
-                      <span className="text-white/40 text-[10px]">@{p.seller?.username ?? '—'}</span>
-                      {p.category && <span className="text-white/40 text-[10px]">{p.category}</span>}
-                    </div>
-                  </div>
-                </motion.div>
-              )
-            })}
-          </div>
+          <ResultGrid items={results} onItemClick={onResultClick} />
         </>
       )}
+    </div>
+  )
+}
+
+// Extracted so the search-results grid and the empty-state-recommendation
+// grid render identically — same card design, same click semantics.
+function ResultGrid({ items, onItemClick }: { items: ProductSearchResult[]; onItemClick: (p: ProductSearchResult) => void }) {
+  const parseImages = (s: string): string[] => {
+    try { return JSON.parse(s) || [] } catch { return s ? [s] : [] }
+  }
+  return (
+    <div className="grid grid-cols-2 gap-2 px-3">
+      {items.map((p) => {
+        const images = parseImages(p.images)
+        const cover = images[0] || `https://picsum.photos/seed/p${p.id}/400/400`
+        return (
+          <motion.div
+            key={p.id}
+            whileTap={{ scale: 0.97 }}
+            onClick={() => onItemClick(p)}
+            className={`relative bg-white/5 rounded-xl overflow-hidden ${p.auction_id ? 'cursor-pointer' : 'cursor-default'}`}
+          >
+            <div className="relative aspect-[4/5]">
+              <img src={cover} alt={p.title} className="w-full h-full object-cover" loading="lazy" />
+              {p.auction_id && (
+                <span className="absolute top-1.5 left-1.5 bg-brand-pink text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full flex items-center gap-0.5">
+                  <Zap size={10} /> 拍卖中
+                </span>
+              )}
+              {p.status === 'active' && !p.auction_id && (
+                <span className="absolute top-1.5 left-1.5 bg-white/20 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">
+                  待开拍
+                </span>
+              )}
+            </div>
+            <div className="p-2">
+              <div className="text-white text-sm font-bold line-clamp-1">{p.title}</div>
+              <div className="flex items-center justify-between mt-1">
+                <span className="text-white/40 text-[10px]">@{p.seller?.username ?? '—'}</span>
+                {p.category && <span className="text-white/40 text-[10px]">{p.category}</span>}
+              </div>
+            </div>
+          </motion.div>
+        )
+      })}
     </div>
   )
 }

@@ -13,6 +13,7 @@ import Search from './pages/Search'
 import Rooms from './pages/Rooms'
 import RoomDetail from './pages/RoomDetail'
 import FavoritesAndFollows from './pages/FavoritesAndFollows'
+import Credit from './pages/Credit'
 import { useAuthStore, useFavoritesStore } from './services/store'
 import wsClient from './services/websocket'
 import { useOutbidNotifier, ensureNotificationPermission } from './hooks/useOutbidNotifier'
@@ -105,6 +106,7 @@ export default function App() {
         <Route path="/rooms" element={<ProtectedRoute><Rooms /></ProtectedRoute>} />
         <Route path="/rooms/:id" element={<ProtectedRoute><RoomDetail /></ProtectedRoute>} />
         <Route path="/likes" element={<ProtectedRoute><FavoritesAndFollows /></ProtectedRoute>} />
+        <Route path="/credit" element={<ProtectedRoute><Credit /></ProtectedRoute>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
       <BottomNav />
