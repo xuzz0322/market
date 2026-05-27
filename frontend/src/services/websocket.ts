@@ -42,6 +42,10 @@ class AuctionWebSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private watchdogTimer: ReturnType<typeof setTimeout> | null = null
   private currentAuctions: Set<number> = new Set()
+  // Auction-room channels the user is subscribed to. Re-joined on reconnect
+  // alongside currentAuctions so live-stream signaling resumes seamlessly
+  // after a transient WS drop.
+  private currentRooms: Set<number> = new Set()
   private shouldReconnect = true
   private attempts = 0
 
@@ -93,6 +97,9 @@ class AuctionWebSocket {
       // so any state we missed while disconnected is reconciled here.
       this.currentAuctions.forEach((id) => {
         this.sendRaw({ type: 'join_auction', auction_id: id })
+      })
+      this.currentRooms.forEach((id) => {
+        this.sendRaw({ type: 'join_room', room_id: id })
       })
     }
 
@@ -182,6 +189,44 @@ class AuctionWebSocket {
   leaveAuction(auctionId: number) {
     this.currentAuctions.delete(auctionId)
     this.sendRaw({ type: 'leave_auction', auction_id: auctionId })
+  }
+
+  joinRoom(roomId: number) {
+    this.currentRooms.add(roomId)
+    this.sendRaw({ type: 'join_room', room_id: roomId })
+  }
+
+  leaveRoom(roomId: number) {
+    this.currentRooms.delete(roomId)
+    this.sendRaw({ type: 'leave_room', room_id: roomId })
+  }
+
+  /** Host: announce live-commentary stream is starting. */
+  sendStreamStart(roomId: number) {
+    this.sendRaw({ type: 'stream_start', room_id: roomId })
+  }
+
+  /** Host: announce live-commentary stream stopped. */
+  sendStreamStop(roomId: number) {
+    this.sendRaw({ type: 'stream_stop', room_id: roomId })
+  }
+
+  /** Send a chat message to a room. Server validates + rate-limits. */
+  sendChat(roomId: number, text: string) {
+    this.sendRaw({ type: 'chat_send', room_id: roomId, data: { text } })
+  }
+
+  /**
+   * Forward a WebRTC signaling envelope (offer/answer/ICE) to a specific peer.
+   * Server stamps `from` server-side; the value passed here is ignored by the
+   * server but kept for client-side debugging.
+   */
+  sendWebRTCSignal(roomId: number, toUserId: number, signalType: 'offer' | 'answer' | 'ice' | 'request' | 'bye', payload: unknown) {
+    this.sendRaw({
+      type: 'webrtc_signal',
+      room_id: roomId,
+      data: { from: 0, to: toUserId, signal_type: signalType, payload, room_id: roomId },
+    })
   }
 
   on(type: WSMessageType, handler: MessageHandler) {

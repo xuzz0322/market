@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -219,6 +220,132 @@ func (h *AuctionHandler) Get(c *gin.Context) {
 		"seconds_left":   secondsLeft,
 		"user_bid":       userBidAmount,
 	})
+}
+
+// Recommendations returns active auctions the user is likely interested in,
+// scored by:
+//   1. Same category as the current auction's product (top priority).
+//   2. Categories the user has previously bid on (personalization signal —
+//      a category the user has put money into is the strongest "interest"
+//      signal we have without explicit favorites/follows).
+//
+// Cancelled / pending auctions are excluded since the goal is "what can I
+// bid on right now". The current auction is also excluded.
+//
+// Designed to be cheap: two small queries (current product, user-bid
+// categories) followed by one indexed lookup. Returns up to `limit` rows.
+func (h *AuctionHandler) Recommendations(c *gin.Context) {
+	userID := c.GetUint("userID")
+	idStr := c.Param("id")
+
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	if limit <= 0 || limit > 30 {
+		limit = 10
+	}
+
+	// Look up the current auction's category. We deliberately don't 404 if
+	// it's missing — recommendations are a best-effort companion feature,
+	// and degrading gracefully (return [] instead of 404) keeps the auction
+	// detail page robust if the row was deleted between renders.
+	var current struct {
+		Category  string
+		ProductID uint
+	}
+	h.db.Raw(`
+		SELECT p.category AS category, a.product_id AS product_id
+		FROM auctions a
+		JOIN products p ON a.product_id = p.id
+		WHERE a.id = ?
+	`, idStr).Scan(&current)
+
+	// Categories the user has bid on before — strongest personalization
+	// signal we have. Empty string is filtered out so untyped products
+	// don't poison the IN-list and pull in unrelated noise.
+	var bidCategories []string
+	h.db.Raw(`
+		SELECT DISTINCT p.category
+		FROM bids b
+		JOIN auctions a ON b.auction_id = a.id
+		JOIN products p ON a.product_id = p.id
+		WHERE b.user_id = ? AND p.category != ''
+	`, userID).Scan(&bidCategories)
+
+	// Build the candidate category set: current + user's history.
+	categorySet := make(map[string]bool, len(bidCategories)+1)
+	if current.Category != "" {
+		categorySet[current.Category] = true
+	}
+	for _, c := range bidCategories {
+		categorySet[c] = true
+	}
+
+	if len(categorySet) == 0 {
+		// No signal at all (rare). Fall back to "any active auction" so the
+		// user still has something to discover.
+		var auctions []models.Auction
+		h.db.Preload("Product.Seller").Preload("Seller").
+			Where("status = ? AND id != ?", models.AuctionActive, idStr).
+			Order("view_count DESC").
+			Limit(limit).
+			Find(&auctions)
+		c.JSON(http.StatusOK, attachSecondsLeft(auctions))
+		return
+	}
+
+	categories := make([]string, 0, len(categorySet))
+	for c := range categorySet {
+		categories = append(categories, c)
+	}
+
+	// Pull candidates ordered with the current auction's category first
+	// (so users see "more like this" before "more like things you've bid on").
+	var auctions []models.Auction
+	h.db.
+		Joins("JOIN products ON products.id = auctions.product_id").
+		Preload("Product.Seller").
+		Preload("Seller").
+		Where("auctions.status = ? AND auctions.id != ? AND products.category IN ?",
+			models.AuctionActive, idStr, categories).
+		Order(gorm.Expr("CASE WHEN products.category = ? THEN 0 ELSE 1 END, auctions.view_count DESC", current.Category)).
+		Limit(limit).
+		Find(&auctions)
+
+	c.JSON(http.StatusOK, attachSecondsLeft(auctions))
+}
+
+// attachSecondsLeft is the shared post-processor for any list endpoint that
+// returns active auctions — keeps the seconds_left calculation consistent
+// with /api/auctions.
+func attachSecondsLeft(auctions []models.Auction) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(auctions))
+	for _, a := range auctions {
+		secondsLeft := 0
+		if a.EndTime != nil {
+			secondsLeft = int(time.Until(*a.EndTime).Seconds())
+			if secondsLeft < 0 {
+				secondsLeft = 0
+			}
+		}
+		out = append(out, map[string]interface{}{
+			"id":            a.ID,
+			"product_id":    a.ProductID,
+			"product":       a.Product,
+			"seller_id":     a.SellerID,
+			"seller":        a.Seller,
+			"start_price":   a.StartPrice,
+			"current_price": a.CurrentPrice,
+			"min_increment": a.MinIncrement,
+			"has_buy_now":   a.HasBuyNow,
+			"buy_now_price": a.BuyNowPrice,
+			"duration":      a.Duration,
+			"end_time":      a.EndTime,
+			"status":        a.Status,
+			"bid_count":     a.BidCount,
+			"view_count":    a.ViewCount,
+			"seconds_left":  secondsLeft,
+		})
+	}
+	return out
 }
 
 // Cancel allows the seller to abort an auction in pending or active state.

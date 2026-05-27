@@ -26,6 +26,7 @@ export interface Auction {
   product?: Product
   seller_id: number
   seller?: User
+  room_id?: number
   start_price: number
   current_price: number
   min_increment: number
@@ -114,10 +115,20 @@ export type WSMessageType =
   | 'countdown'
   | 'error'
   | 'view_update'
+  | 'join_room'
+  | 'leave_room'
+  | 'stream_start'
+  | 'stream_stop'
+  | 'webrtc_signal'
+  | 'chat_send'
+  | 'chat_message'
+  | 'host_live'
+  | 'auction_starting'
 
 export interface WSMessage<T = unknown> {
   type: WSMessageType
   auction_id?: number
+  room_id?: number
   data?: T
 }
 
@@ -158,4 +169,58 @@ export interface AuctionCancelData {
 export interface AuthResponse {
   token: string
   user: User
+}
+
+export interface AuctionRoom {
+  id: number
+  host_id: number
+  host?: User
+  title: string
+  description: string
+  cover_url: string
+  status: 'open' | 'closed'
+  current_auction_id?: number
+  is_streaming: boolean
+  total_auctions: number
+  created_at: string
+  updated_at: string
+}
+
+export interface WebRTCSignalData {
+  from: number
+  to: number
+  signal_type: 'offer' | 'answer' | 'ice' | 'request' | 'bye'
+  payload: unknown
+  room_id: number
+}
+
+export interface StreamStateData {
+  room_id: number
+  host_id: number
+  streaming: boolean
+}
+
+export interface ChatMessageData {
+  room_id: number
+  user_id: number
+  username: string
+  avatar: string
+  text: string
+  is_host: boolean
+  timestamp: number
+}
+
+export interface HostLiveData {
+  host_id: number
+  username: string
+  room_id: number
+  room_title: string
+}
+
+export interface AuctionStartingData {
+  host_id: number
+  username: string
+  auction_id: number
+  product_title: string
+  room_id?: number
 }

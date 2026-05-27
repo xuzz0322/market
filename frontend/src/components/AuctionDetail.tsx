@@ -2,11 +2,11 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import toast from 'react-hot-toast'
-import { ArrowLeft, Eye, Heart, Share2, ChevronUp, Trophy, Zap, Info, Users, AlertTriangle, Package } from 'lucide-react'
+import { ArrowLeft, Eye, Heart, Share2, ChevronUp, Trophy, Zap, Info, Users, AlertTriangle, Package, Sparkles } from 'lucide-react'
 import type { Auction, BidRanking, BidUpdateData, AuctionEndData } from '../types'
-import { getAuction, placeBid } from '../services/api'
+import { getAuction, placeBid, getAuctionRecommendations } from '../services/api'
 import wsClient from '../services/websocket'
-import { useAuthStore } from '../services/store'
+import { useAuthStore, useFavoritesStore } from '../services/store'
 import CountdownTimer from './CountdownTimer'
 
 // Floating bid animation particle
@@ -45,8 +45,19 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
   const [ended, setEnded] = useState(false)
   const [cancelled, setCancelled] = useState<{ reason: string } | null>(null)
   const [winner, setWinner] = useState<{ name: string; price: number; winnerId?: number } | null>(null)
-  const [liked, setLiked] = useState(false)
   const [likeCount, setLikeCount] = useState(0)
+
+  // Favorites — backed by zustand store, source-of-truth is the server.
+  // We read directly via selector so the heart re-renders only when THIS
+  // auction's state changes (not on every other favorite toggle).
+  const isFavorited = useFavoritesStore((s) => s.ids.has(auctionId))
+  const toggleFavorite = useFavoritesStore((s) => s.toggle)
+  // Recommendations shown after the auction ends. Lazy-loaded once the
+  // first end/cancel event fires so we don't pay the request cost during
+  // the live bidding phase.
+  const [recommendations, setRecommendations] = useState<Auction[]>([])
+  const [showRecommendations, setShowRecommendations] = useState(false)
+  const recsLoadedRef = useRef(false)
 
   // Last seen sequence — used to detect dropped WS messages and trigger
   // a full HTTP resync when the stream skips. Stored in a ref so the
@@ -207,6 +218,29 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
     }
   }, [auctionId])
 
+  // Once the auction terminates (ended or cancelled), pull recommendations
+  // and surface the overlay. We load lazily — there's no value in fetching
+  // these while the user is actively bidding, and the overlay is the only
+  // place they're shown in this page. The ref guards against re-loading
+  // when both `ended` and `cancelled` change in quick succession.
+  useEffect(() => {
+    if (!ended && !cancelled) return
+    if (recsLoadedRef.current) return
+    recsLoadedRef.current = true
+    getAuctionRecommendations(auctionId, 10)
+      .then((list) => {
+        setRecommendations(list)
+        if (list.length > 0) {
+          // Slight delay so the result/cancel banner gets its entrance
+          // animation before the overlay slides in over it.
+          setTimeout(() => setShowRecommendations(true), 1200)
+        }
+      })
+      .catch(() => {
+        // Silent — recommendations are a non-critical feature.
+      })
+  }, [ended, cancelled, auctionId])
+
   const handleBid = async () => {
     if (!user) { toast.error('请先登录'); return }
     const amount = parseFloat(bidInput)
@@ -309,10 +343,22 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
           </div>
         </div>
 
-        {/* Like */}
-        <button onClick={() => { setLiked(!liked); setLikeCount(c => liked ? c - 1 : c + 1) }} className="flex flex-col items-center gap-1">
-          <motion.div whileTap={{ scale: 1.4 }} className={`text-2xl ${liked ? 'text-red-500' : 'text-white'}`}>
-            <Heart size={28} fill={liked ? 'currentColor' : 'none'} />
+        {/* Like — actual favorite (persisted). The local liked/likeCount
+            state is kept for the count animation, but the heart fill comes
+            from the favorites store. */}
+        <button
+          onClick={async () => {
+            try {
+              const next = await toggleFavorite(auctionId)
+              setLikeCount((c) => next ? c + 1 : Math.max(0, c - 1))
+            } catch {
+              toast.error('操作失败，请稍后重试')
+            }
+          }}
+          className="flex flex-col items-center gap-1"
+        >
+          <motion.div whileTap={{ scale: 1.4 }} className={`text-2xl ${isFavorited ? 'text-red-500' : 'text-white'}`}>
+            <Heart size={28} fill={isFavorited ? 'currentColor' : 'none'} />
           </motion.div>
           <span className="text-white text-xs">{(auction.view_count + likeCount).toLocaleString()}</span>
         </button>
@@ -496,6 +542,14 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
                   >
                     <Package size={16} /> 查看订单 / 填写收货地址
                   </button>
+                  {recommendations.length > 0 && (
+                    <button
+                      onClick={() => setShowRecommendations(true)}
+                      className="w-full mt-2 bg-white/20 text-white font-bold py-2 rounded-xl flex items-center justify-center gap-2 text-sm"
+                    >
+                      <Sparkles size={14} /> 看看其他类似宝贝
+                    </button>
+                  )}
                 </motion.div>
               )
             }
@@ -534,6 +588,22 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
             )
           })()}
         </AnimatePresence>
+
+        {/* "Look at similar items" CTA — shown for any end state (lost,
+            reserve-not-met, no-bids, cancelled) when we have recs to offer.
+            Skipped for the win case because that branch already includes
+            its own equivalent button next to the order CTA. */}
+        {(ended || cancelled) && recommendations.length > 0 && !showRecommendations &&
+         !(ended && winner && winner.winnerId === user?.id) && (
+          <motion.button
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            onClick={() => setShowRecommendations(true)}
+            className="w-full mb-3 bg-white/15 backdrop-blur-md text-white font-bold py-2.5 rounded-2xl flex items-center justify-center gap-2 text-sm border border-white/15"
+          >
+            <Sparkles size={16} className="text-yellow-400" /> 看看其他类似宝贝
+          </motion.button>
+        )}
 
         {/* Bid CTA */}
         {auction.status === 'active' && !ended && !cancelled && user?.id !== auction.seller_id && (
@@ -601,6 +671,79 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
           </>
         )}
       </div>
+
+      {/* Recommendations overlay — surfaces after the auction terminates
+          (won / lost / cancelled / no-bids). Designed to keep the user
+          engaged: pull them straight into another live auction in a category
+          they care about instead of letting them bounce. Slides up from the
+          bottom and is dismissable. The "查看更多" button at the top of the
+          ended banner re-opens it if the user closed it. */}
+      <AnimatePresence>
+        {showRecommendations && recommendations.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setShowRecommendations(false)}
+            className="absolute inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-end"
+          >
+            <motion.div
+              initial={{ y: '100%' }}
+              animate={{ y: 0 }}
+              exit={{ y: '100%' }}
+              transition={{ type: 'spring', damping: 28 }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-full bg-brand-dark border-t border-white/10 rounded-t-3xl p-5 pb-8 max-h-[80vh] overflow-y-auto"
+            >
+              <div className="w-12 h-1 bg-white/20 rounded-full mx-auto mb-4" />
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="font-black text-lg flex items-center gap-2">
+                  <Sparkles size={18} className="text-yellow-400" /> 猜你喜欢
+                </h3>
+                <button onClick={() => setShowRecommendations(false)} className="text-white/50 px-2 text-sm">关闭</button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                {recommendations.map((a) => {
+                  let img = ''
+                  try {
+                    const arr = JSON.parse(a.product?.images || '[]')
+                    img = Array.isArray(arr) ? arr[0] : ''
+                  } catch { /* ignore */ }
+                  if (!img) img = `https://picsum.photos/seed/r${a.id}/400/500`
+                  return (
+                    <motion.button
+                      key={a.id}
+                      whileTap={{ scale: 0.96 }}
+                      onClick={() => {
+                        setShowRecommendations(false)
+                        // Use replace so the back button doesn't bounce the
+                        // user through a stack of ended auctions.
+                        navigate(`/auction/${a.id}`, { replace: true })
+                      }}
+                      className="text-left bg-white/5 rounded-xl overflow-hidden"
+                    >
+                      <div className="relative aspect-[4/5]">
+                        <img src={img} alt={a.product?.title} className="w-full h-full object-cover" loading="lazy" />
+                        <span className="absolute top-1.5 left-1.5 bg-brand-pink text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full flex items-center gap-0.5">
+                          <Zap size={10} /> 直播中
+                        </span>
+                        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-2">
+                          <div className="text-white text-xs font-bold line-clamp-1">{a.product?.title}</div>
+                          <div className="flex items-center justify-between mt-0.5">
+                            <span className="text-brand-pink text-sm font-black">¥{a.current_price.toLocaleString()}</span>
+                            <span className="text-white/60 text-[10px]">{a.bid_count} 出价</span>
+                          </div>
+                        </div>
+                      </div>
+                    </motion.button>
+                  )
+                })}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Rules drawer — slides up from the bottom. Lives at the root of
           the component so it overlays all other content (z-50). The

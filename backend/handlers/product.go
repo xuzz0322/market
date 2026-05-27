@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -79,6 +81,113 @@ func (h *ProductHandler) List(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, products)
+}
+
+// Search returns active products matching a free-text query and/or category.
+// The keyword runs as a LIKE against title + description; we don't pull in
+// MySQL FULLTEXT yet because at our scale (low-six-figure rows) the LIKE plan
+// is fast enough on the title index, and FULLTEXT requires a schema migration
+// the deploy story doesn't currently cover.
+//
+// To make results actionable, each product carries the ID of its currently
+// in-progress auction (if any) so the client can deep-link into the auction
+// room directly from the search results.
+func (h *ProductHandler) Search(c *gin.Context) {
+	q := strings.TrimSpace(c.Query("q"))
+	category := strings.TrimSpace(c.Query("category"))
+
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	page, _ := strconv.Atoi(c.Query("page"))
+	if page < 1 {
+		page = 1
+	}
+
+	if q == "" && category == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of q or category is required"})
+		return
+	}
+
+	// Restrict to publicly browsable states. Drafts and sold items are not
+	// useful in a search result for a buyer.
+	query := h.db.Model(&models.Product{}).
+		Where("status IN ?", []models.ProductStatus{
+			models.ProductActive,
+			models.ProductAuction,
+		})
+
+	if q != "" {
+		// Escape wildcard chars in user input so a query like "50%" doesn't
+		// match everything. We then wrap with our own % for substring match.
+		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+		like := "%" + escaped + "%"
+		query = query.Where("title LIKE ? OR description LIKE ?", like, like)
+	}
+	if category != "" {
+		query = query.Where("category = ?", category)
+	}
+
+	var total int64
+	query.Count(&total)
+
+	var products []models.Product
+	if err := query.
+		Preload("Seller").
+		Order("created_at DESC").
+		Limit(limit).
+		Offset((page - 1) * limit).
+		Find(&products).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to search"})
+		return
+	}
+
+	// For products in 'auctioning' state, attach the active auction's ID so
+	// the UI can deep-link straight into the bid room. One bulk query keeps
+	// this O(1) regardless of result size.
+	auctionByProduct := make(map[uint]uint, len(products))
+	if len(products) > 0 {
+		productIDs := make([]uint, 0, len(products))
+		for _, p := range products {
+			if p.Status == models.ProductAuction {
+				productIDs = append(productIDs, p.ID)
+			}
+		}
+		if len(productIDs) > 0 {
+			type row struct {
+				ProductID uint
+				ID        uint
+			}
+			var rows []row
+			h.db.Model(&models.Auction{}).
+				Select("product_id, id").
+				Where("product_id IN ? AND status IN ?", productIDs, []models.AuctionStatus{
+					models.AuctionPending,
+					models.AuctionActive,
+				}).
+				Scan(&rows)
+			for _, r := range rows {
+				auctionByProduct[r.ProductID] = r.ID
+			}
+		}
+	}
+
+	type result struct {
+		models.Product
+		AuctionID uint `json:"auction_id,omitempty"`
+	}
+	out := make([]result, len(products))
+	for i, p := range products {
+		out[i] = result{Product: p, AuctionID: auctionByProduct[p.ID]}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"products": out,
+		"total":    total,
+		"page":     page,
+		"limit":    limit,
+	})
 }
 
 func (h *ProductHandler) Get(c *gin.Context) {

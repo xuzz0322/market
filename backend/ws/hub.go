@@ -21,6 +21,29 @@ const (
 	MsgCountdown     MessageType = "countdown"
 	MsgError         MessageType = "error"
 	MsgViewUpdate    MessageType = "view_update"
+
+	// Auction-room (multi-auction host space) channel messages.
+	MsgJoinRoom    MessageType = "join_room"
+	MsgLeaveRoom   MessageType = "leave_room"
+	// Host signals start/stop of live A/V commentary. Server broadcasts to
+	// the room channel so all current viewers can negotiate WebRTC peers.
+	MsgStreamStart MessageType = "stream_start"
+	MsgStreamStop  MessageType = "stream_stop"
+	// WebRTC signaling envelope (offer/answer/ice). Server is a pure
+	// router — it forwards by user_id without inspecting the SDP/ICE
+	// payload. Used between host ↔ each viewer in a mesh topology.
+	MsgWebRTCSignal MessageType = "webrtc_signal"
+
+	// Live chat in an auction room. Clients send chat_send; server
+	// validates + rate-limits, then re-emits chat_message to every member
+	// of the room channel.
+	MsgChatSend    MessageType = "chat_send"
+	MsgChatMessage MessageType = "chat_message"
+
+	// Follow-system push: sent personally to a user when a host they
+	// follow goes live or starts a new auction.
+	MsgHostLive       MessageType = "host_live"
+	MsgAuctionStarting MessageType = "auction_starting"
 )
 
 // AuctionCancelData is the payload for auction_cancel messages
@@ -47,7 +70,68 @@ type BidOutbidData struct {
 type Message struct {
 	Type      MessageType     `json:"type"`
 	AuctionID uint            `json:"auction_id,omitempty"`
+	RoomID    uint            `json:"room_id,omitempty"`
 	Data      json.RawMessage `json:"data,omitempty"`
+}
+
+// WebRTCSignalData carries opaque signaling between host and viewer. Server
+// only inspects To/From; the rest is delivered verbatim. From is always
+// stamped server-side from the authenticated client — clients cannot spoof.
+type WebRTCSignalData struct {
+	From       uint            `json:"from"`
+	To         uint            `json:"to"`
+	SignalType string          `json:"signal_type"` // "offer" | "answer" | "ice" | "request" | "bye"
+	Payload    json.RawMessage `json:"payload"`
+	RoomID     uint            `json:"room_id"`
+}
+
+// StreamStateData notifies room viewers of the current host stream status.
+// Sent on stream_start / stream_stop and as a personal snapshot when a
+// viewer joins a room that's already streaming.
+type StreamStateData struct {
+	RoomID    uint `json:"room_id"`
+	HostID    uint `json:"host_id"`
+	Streaming bool `json:"streaming"`
+}
+
+// ChatSendData is what the client sends. Server enriches it with sender
+// identity (taken from the authenticated WS session) before re-broadcasting
+// as MsgChatMessage.
+type ChatSendData struct {
+	Text string `json:"text"`
+}
+
+// ChatMessageData is the broadcast shape every viewer receives. ID is a
+// monotonic per-message client-side disambiguator (so React can use it as
+// a key without collisions if two messages share the same wall-clock ms).
+type ChatMessageData struct {
+	RoomID    uint   `json:"room_id"`
+	UserID    uint   `json:"user_id"`
+	Username  string `json:"username"`
+	Avatar    string `json:"avatar"`
+	Text      string `json:"text"`
+	IsHost    bool   `json:"is_host"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+// HostLiveData is pushed personally to followers when a host they follow
+// starts streaming. Carries enough info for a notification toast without
+// the client needing a follow-up fetch.
+type HostLiveData struct {
+	HostID    uint   `json:"host_id"`
+	Username  string `json:"username"`
+	RoomID    uint   `json:"room_id"`
+	RoomTitle string `json:"room_title"`
+}
+
+// AuctionStartingData notifies followers when a host starts a new auction
+// (typically inside a room they care about).
+type AuctionStartingData struct {
+	HostID       uint   `json:"host_id"`
+	Username     string `json:"username"`
+	AuctionID    uint   `json:"auction_id"`
+	ProductTitle string `json:"product_title"`
+	RoomID       uint   `json:"room_id,omitempty"`
 }
 
 // BidUpdateData is the payload for bid_update messages.
@@ -89,6 +173,11 @@ type Hub struct {
 	mu       sync.RWMutex
 	clients  map[*Client]bool
 	rooms    map[uint]map[*Client]bool // auctionID -> clients
+	// auctionRoomMembers indexes clients by AuctionRoom (host space) so we
+	// can fan out room-scoped messages independently of any specific
+	// auction. A client can be in both a room channel AND an auction room
+	// at the same time when the room is live-streaming a current auction.
+	auctionRoomMembers map[uint]map[*Client]bool
 	// userClients indexes connections by user_id so we can push targeted
 	// notifications (e.g., "you've been outbid") without scanning every
 	// client. A single user can have multiple connections (mobile + web)
@@ -121,13 +210,14 @@ type RoomMessage struct {
 
 func NewHub() *Hub {
 	return &Hub{
-		clients:     make(map[*Client]bool),
-		rooms:       make(map[uint]map[*Client]bool),
-		userClients: make(map[uint]map[*Client]bool),
-		register:    make(chan *Client, 256),
-		unregister:  make(chan *Client, 256),
-		broadcast:   make(chan *RoomMessage, 1024),
-		seqMap:      make(map[uint]uint64),
+		clients:            make(map[*Client]bool),
+		rooms:              make(map[uint]map[*Client]bool),
+		auctionRoomMembers: make(map[uint]map[*Client]bool),
+		userClients:        make(map[uint]map[*Client]bool),
+		register:           make(chan *Client, 256),
+		unregister:         make(chan *Client, 256),
+		broadcast:          make(chan *RoomMessage, 1024),
+		seqMap:             make(map[uint]uint64),
 	}
 }
 
@@ -175,6 +265,15 @@ func (h *Hub) Run() {
 						delete(room, client)
 						if len(room) == 0 {
 							delete(h.rooms, auctionID)
+						}
+					}
+				}
+				// Remove from all auction-room channels.
+				for roomID, members := range h.auctionRoomMembers {
+					if _, in := members[client]; in {
+						delete(members, client)
+						if len(members) == 0 {
+							delete(h.auctionRoomMembers, roomID)
 						}
 					}
 				}
@@ -268,6 +367,55 @@ func (h *Hub) LeaveRoom(client *Client, auctionID uint) {
 		if len(room) == 0 {
 			delete(h.rooms, auctionID)
 		}
+	}
+}
+
+// JoinAuctionRoom subscribes a client to a host-owned room channel. Distinct
+// from JoinRoom (which keys on auction_id) — a viewer can be in both
+// simultaneously when watching a live-auction inside a room.
+func (h *Hub) JoinAuctionRoom(client *Client, roomID uint) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.auctionRoomMembers[roomID] == nil {
+		h.auctionRoomMembers[roomID] = make(map[*Client]bool)
+	}
+	h.auctionRoomMembers[roomID][client] = true
+}
+
+func (h *Hub) LeaveAuctionRoom(client *Client, roomID uint) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if members, ok := h.auctionRoomMembers[roomID]; ok {
+		delete(members, client)
+		if len(members) == 0 {
+			delete(h.auctionRoomMembers, roomID)
+		}
+	}
+}
+
+// BroadcastToAuctionRoom fans out a message to every client subscribed to a
+// host-owned room channel. Used for stream_start/stream_stop notifications
+// and any future room-level event (host announcements, item intro updates).
+//
+// Does NOT remote-publish via Pub/Sub: room signaling is per-pod for the v1
+// WebRTC mesh implementation. Cross-pod relay can be added later if a host
+// and a viewer ever land on different pods (today they'd both go through
+// the load balancer's sticky session anyway).
+func (h *Hub) BroadcastToAuctionRoom(roomID uint, msg interface{}) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Error marshaling room broadcast: %v", err)
+		return
+	}
+	h.mu.RLock()
+	members := h.auctionRoomMembers[roomID]
+	clients := make([]*Client, 0, len(members))
+	for c := range members {
+		clients = append(clients, c)
+	}
+	h.mu.RUnlock()
+	for _, c := range clients {
+		h.deliver(c, data)
 	}
 }
 

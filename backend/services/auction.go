@@ -184,6 +184,13 @@ func (s *AuctionService) EndAuction(auction *models.Auction) {
 		winnerID = &topBid.UserID
 	}
 	s.broadcastEndAndCleanup(auction, winnerName, winnerID)
+
+	// Room queue advance — runs after the broadcast so viewers see the
+	// "ended" state for the previous auction before the room flips to the
+	// next one. Standalone auctions (no RoomID) are unaffected.
+	if auction.RoomID != nil {
+		s.advanceRoomQueue(*auction.RoomID, auction.ID)
+	}
 }
 
 // broadcastEndAndCleanup is the common tail of EndAuction. It sends the
@@ -530,8 +537,95 @@ func (s *AuctionService) StartAuction(auction *models.Auction) error {
 		Data:      mustMarshal(auction),
 	})
 
+	// Notify followers of the seller. Done in a goroutine so a slow
+	// follower-fan-out can't slow down the auction-start critical path.
+	go s.notifyFollowersAuctionStart(auction)
+
 	log.Printf("Auction %d started, ends at %v", auction.ID, endTime)
 	return nil
+}
+
+// notifyFollowersAuctionStart pushes "this host you follow just started a
+// new auction" alerts. Best-effort: any errors are logged and swallowed —
+// the auction start succeeded regardless of whether the notification went
+// out, and re-running is safe (notifications are stateless).
+func (s *AuctionService) notifyFollowersAuctionStart(auction *models.Auction) {
+	productTitle := ""
+	username := ""
+	if auction.Product != nil {
+		productTitle = auction.Product.Title
+	}
+	if auction.Seller != nil {
+		username = auction.Seller.Username
+	}
+
+	var followers []uint
+	s.db.Model(&models.Follow{}).
+		Where("host_id = ?", auction.SellerID).
+		Pluck("follower_id", &followers)
+	if len(followers) == 0 {
+		return
+	}
+
+	var roomID uint
+	if auction.RoomID != nil {
+		roomID = *auction.RoomID
+	}
+	payload := ws.AuctionStartingData{
+		HostID:       auction.SellerID,
+		Username:     username,
+		AuctionID:    auction.ID,
+		ProductTitle: productTitle,
+		RoomID:       roomID,
+	}
+	for _, fid := range followers {
+		if fid == auction.SellerID {
+			continue // don't notify the host of their own action
+		}
+		s.hub.PushToUser(fid, ws.Message{
+			Type:      ws.MsgAuctionStarting,
+			AuctionID: auction.ID,
+			RoomID:    roomID,
+			Data:      mustMarshal(payload),
+		})
+	}
+}
+
+// NotifyFollowersHostLive is invoked from the WS handler when a host toggles
+// their stream on. Pushes a personal notification to every follower so they
+// can pop a toast / browser notification and tap to watch.
+func (s *AuctionService) NotifyFollowersHostLive(hostID, roomID uint) {
+	var host models.User
+	if err := s.db.Select("id, username").First(&host, hostID).Error; err != nil {
+		return
+	}
+	var room models.AuctionRoom
+	if err := s.db.Select("id, title").First(&room, roomID).Error; err != nil {
+		return
+	}
+	var followers []uint
+	s.db.Model(&models.Follow{}).
+		Where("host_id = ?", hostID).
+		Pluck("follower_id", &followers)
+	if len(followers) == 0 {
+		return
+	}
+	payload := ws.HostLiveData{
+		HostID:    host.ID,
+		Username:  host.Username,
+		RoomID:    room.ID,
+		RoomTitle: room.Title,
+	}
+	for _, fid := range followers {
+		if fid == hostID {
+			continue
+		}
+		s.hub.PushToUser(fid, ws.Message{
+			Type:   ws.MsgHostLive,
+			RoomID: room.ID,
+			Data:   mustMarshal(payload),
+		})
+	}
 }
 
 // CancelAuction aborts an auction in pending or active state. Used by sellers
@@ -602,5 +696,63 @@ func (s *AuctionService) CancelAuction(auction *models.Auction, reason string) e
 		s.OnAuctionFinalized(ctx, id)
 	}(auction.ID)
 
+	if auction.RoomID != nil {
+		s.advanceRoomQueue(*auction.RoomID, auction.ID)
+	}
+
 	return nil
+}
+
+// advanceRoomQueue is invoked when an auction inside a room reaches a
+// terminal state (ended or cancelled). It clears the room's CurrentAuctionID
+// pointer if it still points at the just-ended auction, then promotes the
+// oldest pending auction in that room (if any).
+//
+// Idempotency: only the FIRST caller will see CurrentAuctionID still
+// pointing at endedAuctionID — the conditional UPDATE turns later callers
+// into no-ops, so a duplicate end-event (rare race between scanner and
+// manual cancel) doesn't double-advance.
+//
+// We don't hold a tx around this because StartAuction itself does its own
+// writes and broadcasts — wrapping it would either block readers or
+// require careful re-design. The worst-case race is "two concurrent
+// advances" which the conditional UPDATE rejects.
+func (s *AuctionService) advanceRoomQueue(roomID, endedAuctionID uint) {
+	// Clear the pointer only if it still points at the just-ended auction.
+	// If the host already moved on (manual StartNext) we leave it alone.
+	res := s.db.Model(&models.AuctionRoom{}).
+		Where("id = ? AND current_auction_id = ?", roomID, endedAuctionID).
+		Update("current_auction_id", nil)
+	if res.Error != nil {
+		log.Printf("Room %d advance: failed to clear pointer: %v", roomID, res.Error)
+		return
+	}
+	if res.RowsAffected == 0 {
+		// Pointer was already moved — another caller advanced us first.
+		return
+	}
+
+	// Check the room is still open before auto-starting; if the host
+	// closed it between auctions we don't surprise-start a new one.
+	var room models.AuctionRoom
+	if err := s.db.First(&room, roomID).Error; err != nil || room.Status != models.RoomOpen {
+		return
+	}
+
+	// Promote next pending auction.
+	var next models.Auction
+	if err := s.db.Where("room_id = ? AND status = ?", roomID, models.AuctionPending).
+		Order("created_at ASC").
+		First(&next).Error; err != nil {
+		// Empty queue — room idles until host adds more.
+		return
+	}
+
+	if err := s.StartAuction(&next); err != nil {
+		log.Printf("Room %d advance: failed to start auction %d: %v", roomID, next.ID, err)
+		return
+	}
+	s.db.Model(&models.AuctionRoom{}).Where("id = ?", roomID).
+		Update("current_auction_id", next.ID)
+	log.Printf("Room %d auto-advanced: auction %d → %d", roomID, endedAuctionID, next.ID)
 }

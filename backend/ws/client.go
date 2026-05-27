@@ -13,7 +13,11 @@ const (
 	writeWait      = 10 * time.Second
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 512
+	// Bumped from 512 to 64KB to accommodate WebRTC SDP offers/answers.
+	// A typical offer is 2-4KB; trickle ICE candidates are <1KB. The 10x
+	// buffer below the read deadline is now superfluous given this size,
+	// but kept for parity with previous behaviour.
+	maxMessageSize = 64 * 1024
 	// maxDropCount: kill the connection after this many consecutive
 	// "channel full + drop-oldest still full" events. Indicates the client
 	// is permanently stuck (TCP RWND collapsed or dead peer that hasn't
@@ -41,7 +45,7 @@ func (c *Client) ReadPump(onMessage func(client *Client, msg *Message)) {
 		c.Conn.Close()
 	}()
 
-	c.Conn.SetReadLimit(maxMessageSize * 10)
+	c.Conn.SetReadLimit(maxMessageSize)
 	c.Conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.Conn.SetPongHandler(func(string) error {
 		c.Conn.SetReadDeadline(time.Now().Add(pongWait))

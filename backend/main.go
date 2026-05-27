@@ -94,11 +94,18 @@ func main() {
 	wsH := handlers.NewWSHandler(db, hub, auctionSvc, viewers)
 	adminH := handlers.NewAdminHandler(db)
 	orderH := handlers.NewOrderHandler(db)
+	roomH := handlers.NewRoomHandler(db, auctionSvc)
+	socialH := handlers.NewSocialHandler(db, hub)
 
 	api := r.Group("/api")
 	{
 		api.POST("/register", authH.Register)
 		api.POST("/login", authH.Login)
+
+		// Public search — no auth required so unauthenticated users can
+		// browse before signing up. Same handler is reused on the auth
+		// path below for consistency in case we want to personalize later.
+		api.GET("/products/search", productH.Search)
 
 		auth := api.Group("", middleware.JWTAuth(), apiLimiter.Middleware())
 		{
@@ -113,8 +120,31 @@ func main() {
 			auth.POST("/auctions", auctionH.Create)
 			auth.GET("/auctions", auctionH.List)
 			auth.GET("/auctions/:id", auctionH.Get)
+			auth.GET("/auctions/:id/recommendations", auctionH.Recommendations)
 			auth.POST("/auctions/:id/start", auctionH.Start)
 			auth.POST("/auctions/:id/cancel", auctionH.Cancel)
+
+			// User-hosted auction rooms — anyone can host. Room ownership
+			// is enforced inside each handler via host_id checks.
+			auth.POST("/rooms", roomH.Create)
+			auth.GET("/rooms", roomH.List)
+			auth.GET("/rooms/:id", roomH.Get)
+			auth.PATCH("/rooms/:id", roomH.Update)
+			auth.POST("/rooms/:id/close", roomH.Close)
+			auth.POST("/rooms/:id/auctions", roomH.AddAuction)
+			auth.POST("/rooms/:id/start-next", roomH.StartNext)
+
+			// Favorites — wishlist for auctions.
+			auth.GET("/me/favorites", socialH.MyFavorites)
+			auth.GET("/me/favorite-ids", socialH.FavoriteIDs)
+			auth.POST("/auctions/:id/favorite", socialH.FavoriteAuction)
+			auth.DELETE("/auctions/:id/favorite", socialH.UnfavoriteAuction)
+
+			// Follow — viewer→host edges. Used for go-live push alerts.
+			auth.GET("/me/follows", socialH.MyFollows)
+			auth.GET("/users/:id/follow", socialH.FollowState)
+			auth.POST("/users/:id/follow", socialH.Follow)
+			auth.DELETE("/users/:id/follow", socialH.Unfollow)
 
 			// Bid endpoint gets a dedicated, tighter limiter.
 			auth.POST("/auctions/:id/bids", bidLimiter.Middleware(), bidH.PlaceBid)
@@ -199,9 +229,12 @@ func autoMigrate(db *gorm.DB) {
 	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Product{},
+		&models.AuctionRoom{},
 		&models.Auction{},
 		&models.Bid{},
 		&models.Order{},
+		&models.Favorite{},
+		&models.Follow{},
 	); err != nil {
 		log.Fatal("AutoMigrate failed:", err)
 	}

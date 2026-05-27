@@ -21,6 +21,12 @@ type Auction struct {
 	Product       *Product      `json:"product,omitempty" gorm:"foreignKey:ProductID"`
 	SellerID      uint          `json:"seller_id" gorm:"not null;index"`
 	Seller        *User         `json:"seller,omitempty" gorm:"foreignKey:SellerID"`
+	// RoomID, when set, places this auction inside an AuctionRoom queue.
+	// Auctions WITHOUT a RoomID are standalone (legacy /create flow). The
+	// auction lifecycle is identical either way; the room only governs
+	// scheduling (auto-advance) and grouping in the UI.
+	RoomID        *uint         `json:"room_id" gorm:"index"`
+	Room          *AuctionRoom  `json:"room,omitempty" gorm:"foreignKey:RoomID"`
 	StartPrice    float64       `json:"start_price" gorm:"type:decimal(12,2);not null"`
 	CurrentPrice  float64       `json:"current_price" gorm:"type:decimal(12,2);not null"`
 	MinIncrement  float64       `json:"min_increment" gorm:"type:decimal(12,2);default:1"`

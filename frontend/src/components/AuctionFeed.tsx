@@ -1,11 +1,14 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
+import { useNavigate } from 'react-router-dom'
+import { Search as SearchIcon } from 'lucide-react'
 import type { Auction } from '../types'
 import { listAuctions } from '../services/api'
 import wsClient from '../services/websocket'
 import AuctionDetail from './AuctionDetail'
 
 export default function AuctionFeed() {
+  const navigate = useNavigate()
   const [auctions, setAuctions] = useState<Auction[]>([])
   const [currentIndex, setCurrentIndex] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -114,6 +117,16 @@ export default function AuctionFeed() {
       onTouchStart={handleTouchStart}
       onTouchEnd={handleTouchEnd}
     >
+      {/* Search entry — top-left so it doesn't compete with the right-side
+          action column inside each auction card. */}
+      <button
+        onClick={() => navigate('/search')}
+        className="absolute top-4 left-4 z-30 w-10 h-10 rounded-full bg-black/40 backdrop-blur-md flex items-center justify-center text-white border border-white/15"
+        aria-label="搜索"
+      >
+        <SearchIcon size={18} />
+      </button>
+
       {/* Feed items */}
       <div
         className="h-full transition-transform duration-500 ease-in-out"
