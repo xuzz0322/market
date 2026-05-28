@@ -20,3 +20,18 @@ type Follow struct {
 	HostID     uint      `json:"host_id" gorm:"not null;index;uniqueIndex:idx_follower_host"`
 	CreatedAt  time.Time `json:"created_at"`
 }
+
+// Block records a user→target block. Blocked users' auctions and rooms are
+// hidden from the blocker in discovery feeds, and the blocked user cannot
+// see the blocker's bids or profile information.
+//
+// We deliberately do NOT notify the blocked user — receiving a notification
+// that you've been blocked is poor UX and serves no product goal.
+//
+// Composite uniqueIndex on (blocker_id, blocked_id) keeps it idempotent.
+type Block struct {
+	ID         uint      `json:"id" gorm:"primaryKey"`
+	BlockerID  uint      `json:"-" gorm:"not null;index;uniqueIndex:idx_blocker_blocked"`
+	BlockedID  uint      `json:"blocked_id" gorm:"not null;index;uniqueIndex:idx_blocker_blocked"`
+	CreatedAt  time.Time `json:"created_at"`
+}

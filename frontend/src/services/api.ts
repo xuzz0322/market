@@ -97,6 +97,9 @@ export const createRoom = (data: { title: string; description?: string; cover_ur
 export const listRooms = (params?: { mine?: boolean; limit?: number }) =>
   api.get<AuctionRoom[]>('/rooms', { params }).then((r) => r.data)
 
+export const listHotRooms = (limit = 20) =>
+  api.get<AuctionRoom[]>('/rooms/hot', { params: { limit } }).then((r) => r.data)
+
 export interface RoomDetailResponse {
   room: AuctionRoom
   current: (Auction & { seconds_left: number }) | null
@@ -161,6 +164,32 @@ export const followUser = (hostId: number) =>
 export const unfollowUser = (hostId: number) =>
   api.delete<{ following: boolean }>(`/users/${hostId}/follow`).then((r) => r.data)
 
+export const followedRooms = () =>
+  api.get<AuctionRoom[]>('/me/followed-rooms').then((r) => r.data)
+
+// Blocks
+export interface BlockedUser {
+  id: number
+  username: string
+  avatar: string
+  blocked_at: string
+}
+
+export const myBlocks = () =>
+  api.get<BlockedUser[]>('/me/blocks').then((r) => r.data)
+
+export const myBlockedIds = () =>
+  api.get<number[]>('/me/blocked-ids').then((r) => r.data)
+
+export const getBlockState = (userId: number) =>
+  api.get<{ blocked: boolean }>(`/users/${userId}/block`).then((r) => r.data)
+
+export const blockUser = (userId: number) =>
+  api.post<{ blocked: boolean }>(`/users/${userId}/block`).then((r) => r.data)
+
+export const unblockUser = (userId: number) =>
+  api.delete<{ blocked: boolean }>(`/users/${userId}/block`).then((r) => r.data)
+
 // Deposits — earnest payment for deposit-gated auctions.
 export interface DepositState {
   required: boolean
@@ -224,6 +253,58 @@ export const getBids = (auctionId: number) =>
 // Orders (buyer side)
 export const getMyOrders = (status?: string) =>
   api.get<Order[]>('/orders', { params: { status } }).then((r) => r.data)
+
+export interface TradeHistoryResponse {
+  orders: Order[]
+  total_count: number
+  completed_count: number
+}
+
+export interface BuyHistoryResponse extends TradeHistoryResponse {
+  total_spent: number
+}
+
+export interface SellHistoryResponse extends TradeHistoryResponse {
+  total_earned: number
+}
+
+export const myBuyHistory = () =>
+  api.get<BuyHistoryResponse>('/me/buy-history').then((r) => r.data)
+
+export const mySellHistory = () =>
+  api.get<SellHistoryResponse>('/me/sell-history').then((r) => r.data)
+
+// Direct Messages
+export interface DMConversation {
+  peer_id: number
+  username: string
+  avatar: string
+  last_body: string
+  last_at: string
+  unread_count: number
+}
+
+export interface DirectMessage {
+  id: number
+  sender_id: number
+  sender?: { id: number; username: string; avatar: string }
+  receiver_id: number
+  body: string
+  read_at?: string
+  created_at: string
+}
+
+export const getDMInbox = () =>
+  api.get<DMConversation[]>('/me/messages').then((r) => r.data)
+
+export const getDMUnread = () =>
+  api.get<{ unread: number }>('/me/messages/unread').then((r) => r.data)
+
+export const getDMThread = (userId: number, params?: { before?: number; limit?: number }) =>
+  api.get<DirectMessage[]>(`/users/${userId}/messages`, { params }).then((r) => r.data)
+
+export const sendDM = (userId: number, body: string) =>
+  api.post<DirectMessage>(`/users/${userId}/messages`, { body }).then((r) => r.data)
 
 export const setOrderAddress = (id: number, address: ShippingAddress) =>
   api.post<Order>(`/orders/${id}/address`, { address }).then((r) => r.data)

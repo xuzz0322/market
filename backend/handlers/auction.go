@@ -156,8 +156,15 @@ func (h *AuctionHandler) Start(c *gin.Context) {
 }
 
 func (h *AuctionHandler) List(c *gin.Context) {
+	userID := c.GetUint("userID")
 	var auctions []models.Auction
 	query := h.db.Preload("Product").Preload("Seller").Preload("Winner").Order("created_at DESC")
+
+	// Exclude auctions whose seller the caller has blocked. A zero userID
+	// (unauthenticated path) skips the subquery entirely.
+	if userID > 0 {
+		query = query.Where("seller_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)", userID)
+	}
 
 	status := c.Query("status")
 	if status != "" {

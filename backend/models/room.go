@@ -41,6 +41,11 @@ type AuctionRoom struct {
 	// effort: if the host's tab crashes the flag stays true until the
 	// host re-toggles it; viewers handle the no-response case gracefully.
 	IsStreaming      bool      `json:"is_streaming" gorm:"default:false"`
+	// HeatScore is the last computed heat value, written back from Redis
+	// by the heat scanner so SQL-based sorts and the admin dashboard can
+	// use it without a Redis round-trip. Approximate — only as fresh as
+	// the last scanner tick (30s).
+	HeatScore        float64   `json:"heat_score" gorm:"type:decimal(12,2);default:0;index"`
 	TotalAuctions    int       `json:"total_auctions" gorm:"default:0;comment:'lifetime count'"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`

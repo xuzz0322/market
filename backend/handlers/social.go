@@ -1,26 +1,26 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"market/cache"
 	"market/models"
 )
 
 type SocialHandler struct {
-	db  *gorm.DB
-	hub interface {
-		PushToUser(userID uint, msg interface{})
-	}
+	db    *gorm.DB
+	hub   interface{ PushToUser(userID uint, msg interface{}) }
+	cache *cache.Client
 }
 
-func NewSocialHandler(db *gorm.DB, hub interface {
-	PushToUser(userID uint, msg interface{})
-}) *SocialHandler {
-	return &SocialHandler{db: db, hub: hub}
+func NewSocialHandler(db *gorm.DB, hub interface{ PushToUser(userID uint, msg interface{}) }, c *cache.Client) *SocialHandler {
+	return &SocialHandler{db: db, hub: hub, cache: c}
 }
 
 // ---------- Favorites ----------
@@ -46,6 +46,12 @@ func (h *SocialHandler) FavoriteAuction(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to favorite"})
 			return
 		}
+	} else if h.cache != nil && auction.RoomID != nil {
+		// Only increment on a fresh favorite (not a dup), and only for
+		// auctions inside a room so the heat scanner has a room to credit.
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		cache.IncrLikesDelta(ctx, h.cache, *auction.RoomID)
+		cancel()
 	}
 	c.JSON(http.StatusOK, gin.H{"favorited": true})
 }
@@ -206,12 +212,146 @@ func (h *SocialHandler) MyCredit(c *gin.Context) {
 		Limit(50).
 		Find(&events)
 	c.JSON(http.StatusOK, gin.H{
-		"score":         u.CreditScore,
-		"min_to_bid":    models.CreditMinToBid,
-		"max_score":     models.CreditMaxScore,
-		"can_bid":       u.CreditScore >= models.CreditMinToBid,
-		"events":        events,
+		"score":      u.CreditScore,
+		"min_to_bid": models.CreditMinToBid,
+		"max_score":  models.CreditMaxScore,
+		"can_bid":    u.CreditScore >= models.CreditMinToBid,
+		"events":     events,
 	})
+}
+
+// ---------- Blocks ----------
+
+// BlockUser adds a block from the caller onto the target. Idempotent.
+// Also removes any existing follow in the same direction — you can't
+// follow someone you've blocked (it would be confusing to still receive
+// their live notifications after blocking them).
+func (h *SocialHandler) BlockUser(c *gin.Context) {
+	userID := c.GetUint("userID")
+	targetID := parseUintParam(c, "id")
+	if targetID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	if targetID == userID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot block yourself"})
+		return
+	}
+
+	block := models.Block{BlockerID: userID, BlockedID: targetID}
+	if err := h.db.Create(&block).Error; err != nil {
+		if !isDuplicate(err) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to block"})
+			return
+		}
+		// Already blocked — idempotent, fall through.
+	}
+
+	// Remove follow in both directions so the blocker stops receiving
+	// live-alerts and the blocked user doesn't still "follow" the blocker.
+	h.db.Where("(follower_id = ? AND host_id = ?) OR (follower_id = ? AND host_id = ?)",
+		userID, targetID, targetID, userID).Delete(&models.Follow{})
+
+	c.JSON(http.StatusOK, gin.H{"blocked": true})
+}
+
+// UnblockUser removes a block. Does NOT restore any prior follow.
+func (h *SocialHandler) UnblockUser(c *gin.Context) {
+	userID := c.GetUint("userID")
+	targetID := parseUintParam(c, "id")
+	if targetID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	h.db.Where("blocker_id = ? AND blocked_id = ?", userID, targetID).Delete(&models.Block{})
+	c.JSON(http.StatusOK, gin.H{"blocked": false})
+}
+
+// MyBlocks lists every user the caller has blocked. Returns minimal profile
+// info so the manage-blocks UI can show name + avatar without extra calls.
+func (h *SocialHandler) MyBlocks(c *gin.Context) {
+	userID := c.GetUint("userID")
+	type row struct {
+		BlockedID uint   `json:"id"`
+		Username  string `json:"username"`
+		Avatar    string `json:"avatar"`
+		BlockedAt time.Time `json:"blocked_at"`
+	}
+	var rows []row
+	h.db.Raw(`
+		SELECT b.blocked_id, u.username, u.avatar, b.created_at AS blocked_at
+		FROM blocks b
+		JOIN users u ON u.id = b.blocked_id
+		WHERE b.blocker_id = ?
+		ORDER BY b.created_at DESC
+	`, userID).Scan(&rows)
+	c.JSON(http.StatusOK, rows)
+}
+
+// MyBlockedIDs returns just the list of blocked user IDs. Used by the
+// auction-list endpoint to filter results client-side without joining.
+func (h *SocialHandler) MyBlockedIDs(c *gin.Context) {
+	userID := c.GetUint("userID")
+	var ids []uint
+	h.db.Model(&models.Block{}).
+		Where("blocker_id = ?", userID).
+		Pluck("blocked_id", &ids)
+	c.JSON(http.StatusOK, ids)
+}
+
+// BlockState returns whether the caller has blocked the given user.
+func (h *SocialHandler) BlockState(c *gin.Context) {
+	userID := c.GetUint("userID")
+	targetID := parseUintParam(c, "id")
+	var count int64
+	h.db.Model(&models.Block{}).
+		Where("blocker_id = ? AND blocked_id = ?", userID, targetID).
+		Count(&count)
+	c.JSON(http.StatusOK, gin.H{"blocked": count > 0})
+}
+
+// ---------- Followed rooms ----------
+
+// FollowedRooms returns the open auction rooms whose host the caller follows,
+// sorted by heat_score desc so the most active followed rooms bubble up.
+// This is the data source for the "关注的拍卖间" tab on the home feed.
+func (h *SocialHandler) FollowedRooms(c *gin.Context) {
+	userID := c.GetUint("userID")
+
+	// Collect host IDs the user follows.
+	var hostIDs []uint
+	h.db.Model(&models.Follow{}).
+		Where("follower_id = ?", userID).
+		Pluck("host_id", &hostIDs)
+
+	if len(hostIDs) == 0 {
+		c.JSON(http.StatusOK, []models.AuctionRoom{})
+		return
+	}
+
+	// Exclude rooms hosted by anyone the caller has blocked (belt +
+	// suspenders — if you later block someone you follow, their room
+	// vanishes immediately).
+	var blockedIDs []uint
+	h.db.Model(&models.Block{}).
+		Where("blocker_id = ?", userID).
+		Pluck("blocked_id", &blockedIDs)
+
+	query := h.db.Model(&models.AuctionRoom{}).
+		Preload("Host").
+		Where("host_id IN ? AND status = ?", hostIDs, models.RoomOpen).
+		Order("heat_score DESC, current_auction_id IS NOT NULL DESC")
+
+	if len(blockedIDs) > 0 {
+		query = query.Where("host_id NOT IN ?", blockedIDs)
+	}
+
+	var rooms []models.AuctionRoom
+	if err := query.Find(&rooms).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch"})
+		return
+	}
+	c.JSON(http.StatusOK, rooms)
 }
 
 // ---------- Helpers ----------

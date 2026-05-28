@@ -41,3 +41,20 @@ func UserCache(id uint) string { return fmt.Sprintf("user:cache:%d", id) }
 // to it; subscribers re-dispatch to their local hub rooms (skipping their
 // own publishes via instance_id deduplication).
 const WSBroadcastChannel = "ws:broadcast"
+
+// RoomHeat is the sorted set ranking live auction rooms by heat score.
+//   Score:  float64 heat value (higher = hotter)
+//   Member: room_id (as string)
+// Refreshed every 30s by the heat scanner; consumed by the room list
+// endpoint and the global WS heat-update broadcast.
+const RoomHeat = "room:heat"
+
+// RoomLikesDelta tracks new favorites since the last heat cycle for a room.
+// Incremented by the social handler on each new favorite; reset by the
+// heat scanner after it reads the value.
+func RoomLikesDelta(roomID uint) string { return fmt.Sprintf("room:likes_delta:%d", roomID) }
+
+// AuctionBidsDelta tracks bids placed in the last heat window (1h) for a
+// running auction. INCR on each bid; heat scanner reads all active-auction
+// counters in a pipeline.
+func AuctionBidsDelta(auctionID uint) string { return fmt.Sprintf("auction:bids_delta:%d", auctionID) }

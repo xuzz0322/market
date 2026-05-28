@@ -9,15 +9,17 @@ import (
 	"gorm.io/gorm"
 
 	"market/models"
+	"market/mq"
 	"market/services"
 )
 
 type OrderHandler struct {
-	db *gorm.DB
+	db       *gorm.DB
+	producer *mq.Producer
 }
 
-func NewOrderHandler(db *gorm.DB) *OrderHandler {
-	return &OrderHandler{db: db}
+func NewOrderHandler(db *gorm.DB, producer *mq.Producer) *OrderHandler {
+	return &OrderHandler{db: db, producer: producer}
 }
 
 // ---- Buyer endpoints ----
@@ -41,6 +43,75 @@ func (h *OrderHandler) MyOrders(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, orders)
+}
+
+// MyBuyHistory returns the caller's complete purchase history with an
+// aggregate summary card so the UI can show "你共买入 X 件，总花费 ¥Y" without
+// a second round-trip. Only completed orders count toward the summary to
+// match what users intuitively consider "money spent".
+func (h *OrderHandler) MyBuyHistory(c *gin.Context) {
+	userID := c.GetUint("userID")
+
+	var orders []models.Order
+	if err := h.db.
+		Where("buyer_id = ?", userID).
+		Preload("Product").
+		Preload("Seller").
+		Preload("Auction").
+		Order("created_at DESC").
+		Find(&orders).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch"})
+		return
+	}
+
+	var totalSpent float64
+	var completedCount int
+	for _, o := range orders {
+		if o.Status == models.OrderCompleted {
+			totalSpent += o.Amount
+			completedCount++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"orders":          orders,
+		"total_spent":     totalSpent,
+		"completed_count": completedCount,
+		"total_count":     len(orders),
+	})
+}
+
+// MySellHistory returns the caller's complete sell history. Available to
+// every role (not just seller/admin) so a regular user who sold their
+// first item can still see the record without role-gating.
+func (h *OrderHandler) MySellHistory(c *gin.Context) {
+	userID := c.GetUint("userID")
+
+	var orders []models.Order
+	if err := h.db.
+		Where("seller_id = ?", userID).
+		Preload("Product").
+		Preload("Buyer").
+		Preload("Auction").
+		Order("created_at DESC").
+		Find(&orders).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch"})
+		return
+	}
+
+	var totalEarned float64
+	var completedCount int
+	for _, o := range orders {
+		if o.Status == models.OrderCompleted {
+			totalEarned += o.Amount
+			completedCount++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"orders":          orders,
+		"total_earned":    totalEarned,
+		"completed_count": completedCount,
+		"total_count":     len(orders),
+	})
 }
 
 // SetAddress lets the buyer attach a shipping address. Only allowed in
@@ -138,12 +209,18 @@ func (h *OrderHandler) Confirm(c *gin.Context) {
 		return
 	}
 
-	// Credit rewards on a successful transaction. Both buyer and seller
-	// earn — a clean order benefits everyone, and tying credit only to
-	// buyers would push sellers' scores below the threshold over time
-	// from cancellations alone.
-	services.AdjustCredit(tx, order.BuyerID, +5, models.CreditReasonOrderCompleted, "order", order.ID, "确认收货")
-	services.AdjustCredit(tx, order.SellerID, +3, models.CreditReasonOrderCompleted, "order", order.ID, "订单成交完成")
+	// Credit rewards via Kafka (at-least-once). If Kafka is down we fall
+	// back to the synchronous AdjustCredit call so credit is never lost.
+	publishCredit := func(userID uint, delta int, reason, refType, note string) {
+		ev := mq.CreditEvent{UserID: userID, Delta: delta, Reason: reason, RefType: refType, RefID: order.ID, Note: note}
+		if h.producer != nil && h.producer.Available() {
+			_ = h.producer.Publish(mq.TopicCreditAdjust, mq.FormatKey(userID), ev)
+		} else {
+			services.AdjustCredit(tx, userID, delta, models.CreditEventReason(reason), refType, order.ID, note)
+		}
+	}
+	publishCredit(order.BuyerID, +5, string(models.CreditReasonOrderCompleted), "order", "确认收货")
+	publishCredit(order.SellerID, +3, string(models.CreditReasonOrderCompleted), "order", "订单成交完成")
 
 	tx.Commit()
 	h.db.First(&order, order.ID)

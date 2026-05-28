@@ -18,6 +18,7 @@ import (
 	"market/handlers"
 	"market/middleware"
 	"market/models"
+	"market/mq"
 	"market/services"
 	ws "market/ws"
 )
@@ -32,6 +33,7 @@ func main() {
 	redisCli := cache.New()
 	rankings := cache.NewRankingStore(redisCli)
 	viewers := cache.NewViewerCounter(redisCli, db)
+	heatScanner := cache.NewHeatScanner(redisCli, db, nil) // hub wired below
 
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
@@ -61,8 +63,21 @@ func main() {
 
 	go hub.Run()
 
-	auctionSvc := services.NewAuctionService(db, hub, rankings, viewers)
+	// Wire hub into heat scanner now that it's initialised.
+	heatScanner.SetHub(hub)
+
+	// Kafka producer — graceful degrade if KAFKA_BROKERS not set.
+	producer := mq.NewProducer()
+	defer producer.Close()
+
+	// Kafka consumers — start before the HTTP server so messages produced
+	// during boot are consumed promptly.
+	consumers := mq.NewConsumers(db, hub, redisCli, nil)
+	consumers.StartAll(rootCtx)
+
+	auctionSvc := services.NewAuctionService(db, hub, rankings, viewers, producer)
 	go auctionSvc.StartAuctionMonitor()
+	heatScanner.Start(rootCtx)
 
 	// Per-user rate limiters.
 	// Bids: burst 5, sustained 3/s — matches realistic outbid behavior
@@ -90,13 +105,14 @@ func main() {
 	authH := handlers.NewAuthHandler(db)
 	productH := handlers.NewProductHandler(db)
 	auctionH := handlers.NewAuctionHandler(db, hub, auctionSvc)
-	bidH := handlers.NewBidHandler(db, hub, auctionSvc)
+	bidH := handlers.NewBidHandler(db, hub, auctionSvc, redisCli, producer)
 	wsH := handlers.NewWSHandler(db, hub, auctionSvc, viewers)
 	adminH := handlers.NewAdminHandler(db)
-	orderH := handlers.NewOrderHandler(db)
-	roomH := handlers.NewRoomHandler(db, auctionSvc)
-	socialH := handlers.NewSocialHandler(db, hub)
+	orderH := handlers.NewOrderHandler(db, producer)
+	roomH := handlers.NewRoomHandler(db, auctionSvc, redisCli, heatScanner)
+	socialH := handlers.NewSocialHandler(db, hub, redisCli)
 	depositH := handlers.NewDepositHandler(db)
+	dmH := handlers.NewDMHandler(db, producer)
 
 	api := r.Group("/api")
 	{
@@ -130,6 +146,7 @@ func main() {
 			// is enforced inside each handler via host_id checks.
 			auth.POST("/rooms", roomH.Create)
 			auth.GET("/rooms", roomH.List)
+			auth.GET("/rooms/hot", roomH.ListByHeat)
 			auth.GET("/rooms/:id", roomH.Get)
 			auth.PATCH("/rooms/:id", roomH.Update)
 			auth.POST("/rooms/:id/close", roomH.Close)
@@ -144,9 +161,17 @@ func main() {
 
 			// Follow — viewer→host edges. Used for go-live push alerts.
 			auth.GET("/me/follows", socialH.MyFollows)
+			auth.GET("/me/followed-rooms", socialH.FollowedRooms)
 			auth.GET("/users/:id/follow", socialH.FollowState)
 			auth.POST("/users/:id/follow", socialH.Follow)
 			auth.DELETE("/users/:id/follow", socialH.Unfollow)
+
+			// Block — hides blocked user's auctions/rooms from feeds.
+			auth.GET("/me/blocks", socialH.MyBlocks)
+			auth.GET("/me/blocked-ids", socialH.MyBlockedIDs)
+			auth.GET("/users/:id/block", socialH.BlockState)
+			auth.POST("/users/:id/block", socialH.BlockUser)
+			auth.DELETE("/users/:id/block", socialH.UnblockUser)
 
 			// Auction deposits — earnest payment users put down before
 			// being allowed to bid on a deposit-gated auction.
@@ -168,6 +193,16 @@ func main() {
 			auth.GET("/orders/:id", orderH.Get)
 			auth.POST("/orders/:id/address", orderH.SetAddress)
 			auth.POST("/orders/:id/confirm", orderH.Confirm)
+			// Full transaction history — separate from /orders so callers
+			// get summary stats in a single call without wrapping the list.
+			auth.GET("/me/buy-history", orderH.MyBuyHistory)
+			auth.GET("/me/sell-history", orderH.MySellHistory)
+
+			// Private messages — inbox, thread, unread count.
+			auth.GET("/me/messages", dmH.Inbox)
+			auth.GET("/me/messages/unread", dmH.UnreadCount)
+			auth.GET("/users/:id/messages", dmH.Thread)
+			auth.POST("/users/:id/messages", dmH.Send)
 		}
 
 		// Admin / merchant endpoints — gated by role middleware. The route
@@ -247,8 +282,10 @@ func autoMigrate(db *gorm.DB) {
 		&models.Order{},
 		&models.Favorite{},
 		&models.Follow{},
+		&models.Block{},
 		&models.Deposit{},
 		&models.CreditEvent{},
+		&models.DirectMessage{},
 	); err != nil {
 		log.Fatal("AutoMigrate failed:", err)
 	}

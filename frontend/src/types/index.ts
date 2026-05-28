@@ -123,10 +123,12 @@ export type WSMessageType =
   | 'stream_start'
   | 'stream_stop'
   | 'webrtc_signal'
+  | 'heat_update'
   | 'chat_send'
   | 'chat_message'
   | 'host_live'
   | 'auction_starting'
+  | 'dm_received'
 
 export interface WSMessage<T = unknown> {
   type: WSMessageType
@@ -184,6 +186,7 @@ export interface AuctionRoom {
   status: 'open' | 'closed'
   current_auction_id?: number
   is_streaming: boolean
+  heat_score: number
   total_auctions: number
   created_at: string
   updated_at: string

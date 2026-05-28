@@ -8,17 +8,20 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"market/cache"
 	"market/models"
 	"market/services"
 )
 
 type RoomHandler struct {
-	db         *gorm.DB
-	auctionSvc *services.AuctionService
+	db          *gorm.DB
+	auctionSvc  *services.AuctionService
+	cache       *cache.Client
+	heatScanner *cache.HeatScanner
 }
 
-func NewRoomHandler(db *gorm.DB, svc *services.AuctionService) *RoomHandler {
-	return &RoomHandler{db: db, auctionSvc: svc}
+func NewRoomHandler(db *gorm.DB, svc *services.AuctionService, c *cache.Client, hs *cache.HeatScanner) *RoomHandler {
+	return &RoomHandler{db: db, auctionSvc: svc, cache: c, heatScanner: hs}
 }
 
 type CreateRoomRequest struct {
@@ -72,10 +75,11 @@ func (h *RoomHandler) List(c *gin.Context) {
 	if c.Query("mine") == "true" {
 		query = query.Where("host_id = ?", userID)
 	} else {
-		// Public listing: hide closed rooms with no auctions (dead rooms).
-		// Closed-but-historic rooms are still hidden to keep the discovery
-		// list useful — historic content is available via the host's profile.
 		query = query.Where("status = ?", models.RoomOpen)
+		// Hide rooms hosted by blocked users from the public listing.
+		if userID > 0 {
+			query = query.Where("host_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)", userID)
+		}
 	}
 
 	var rooms []models.AuctionRoom
@@ -87,6 +91,68 @@ func (h *RoomHandler) List(c *gin.Context) {
 		return
 	}
 
+	c.JSON(http.StatusOK, rooms)
+}
+
+// ListByHeat returns open rooms sorted by composite heat score, highest
+// first. Tries the Redis ZSET (sub-ms) and falls back to the heat_score
+// MySQL column when Redis is unavailable. Returns at most `limit` rooms
+// with full room + host data attached.
+func (h *RoomHandler) ListByHeat(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+
+	ctx := c.Request.Context()
+	var roomIDs []uint
+	var err error
+
+	if h.heatScanner != nil {
+		roomIDs, err = h.heatScanner.TopRooms(ctx, int64(limit))
+		if err != nil {
+			// Soft fallback — log and continue to the MySQL path below.
+			roomIDs = nil
+		}
+	}
+
+	// If the scanner returned IDs, fetch the full room rows in that order.
+	// We use a FIELD(...) expression to preserve the Redis-ordered ranking.
+	if len(roomIDs) > 0 {
+		// Build the ordered IN list.
+		placeholders := make([]interface{}, len(roomIDs))
+		for i, id := range roomIDs {
+			placeholders[i] = id
+		}
+		var rooms []models.AuctionRoom
+		// Preserve scanner order: MySQL IN() doesn't guarantee order, so
+		// we ORDER BY FIELD(id, id1, id2, ...) to keep the heat ranking.
+		orderExpr := "FIELD(id"
+		for _, id := range roomIDs {
+			orderExpr += "," + strconv.FormatUint(uint64(id), 10)
+		}
+		orderExpr += ")"
+		if err := h.db.Preload("Host").
+			Where("id IN ?", roomIDs).
+			Order(orderExpr).
+			Find(&rooms).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch"})
+			return
+		}
+		c.JSON(http.StatusOK, rooms)
+		return
+	}
+
+	// Pure MySQL fallback (Redis down or no scanner).
+	var rooms []models.AuctionRoom
+	if err := h.db.Model(&models.AuctionRoom{}).Preload("Host").
+		Where("status = ?", models.RoomOpen).
+		Order("heat_score DESC").
+		Limit(limit).
+		Find(&rooms).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch"})
+		return
+	}
 	c.JSON(http.StatusOK, rooms)
 }
 

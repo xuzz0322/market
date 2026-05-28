@@ -26,45 +26,52 @@ func AdjustCredit(db *gorm.DB, userID uint, delta int, reason models.CreditEvent
 		return -1
 	}
 
-	// Lock the user row so concurrent adjustments don't race the clamp.
-	// We use UPDATE ... CASE/clamp inline rather than SELECT FOR UPDATE +
-	// UPDATE so the floor/ceiling enforcement is a single statement.
-	if err := db.Exec(`
-		UPDATE users SET credit_score =
-			CASE
-				WHEN credit_score + ? < 0 THEN 0
-				WHEN credit_score + ? > ? THEN ?
-				ELSE credit_score + ?
-			END
-		WHERE id = ?
-	`, delta, delta, models.CreditMaxScore, models.CreditMaxScore, delta, userID).Error; err != nil {
-		log.Printf("AdjustCredit user=%d: update failed: %v", userID, err)
+	var newScore int
+
+	// Wrap in a mini-tx so the SELECT FOR UPDATE + UPDATE + INSERT are
+	// atomic. We pick the new score inside the lock so CreditEvent.After
+	// is guaranteed to be the value THIS adjustment produced, even when
+	// two concurrent adjustments race.
+	err := db.Transaction(func(tx *gorm.DB) error {
+		// SELECT FOR UPDATE: serialises concurrent score changes for this
+		// user. Without this, two goroutines both reading score=100, both
+		// adding +5, would write 105 twice instead of 110.
+		var u models.User
+		if err := tx.Set("gorm:query_option", "FOR UPDATE").
+			Select("id, credit_score").
+			First(&u, userID).Error; err != nil {
+			return err
+		}
+
+		newScore = u.CreditScore + delta
+		if newScore < 0 {
+			newScore = 0
+		}
+		if newScore > models.CreditMaxScore {
+			newScore = models.CreditMaxScore
+		}
+
+		if err := tx.Model(&models.User{}).
+			Where("id = ?", userID).
+			Update("credit_score", newScore).Error; err != nil {
+			return err
+		}
+
+		ev := models.CreditEvent{
+			UserID:    userID,
+			Delta:     delta,
+			After:     newScore,
+			Reason:    reason,
+			RefType:   refType,
+			RefID:     refID,
+			Note:      note,
+			CreatedAt: time.Now(),
+		}
+		return tx.Create(&ev).Error
+	})
+	if err != nil {
+		log.Printf("AdjustCredit user=%d delta=%d: %v", userID, delta, err)
 		return -1
 	}
-
-	// Read back the resulting score for the audit log. One extra query,
-	// but the alternative (computing the clamp twice in app code) is
-	// fragile and duplicates the SQL CASE.
-	var u models.User
-	if err := db.Select("credit_score").First(&u, userID).Error; err != nil {
-		log.Printf("AdjustCredit user=%d: readback failed: %v", userID, err)
-		return -1
-	}
-
-	ev := models.CreditEvent{
-		UserID:    userID,
-		Delta:     delta,
-		After:     u.CreditScore,
-		Reason:    reason,
-		RefType:   refType,
-		RefID:     refID,
-		Note:      note,
-		CreatedAt: time.Now(),
-	}
-	if err := db.Create(&ev).Error; err != nil {
-		// Log but don't fail — score change still happened, audit row just
-		// missing. Admins will have a small gap, the user state is correct.
-		log.Printf("AdjustCredit user=%d: event log failed: %v", userID, err)
-	}
-	return u.CreditScore
+	return newScore
 }

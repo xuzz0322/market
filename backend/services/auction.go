@@ -9,6 +9,7 @@ import (
 
 	"market/cache"
 	"market/models"
+	"market/mq"
 	"market/ws"
 )
 
@@ -17,10 +18,11 @@ type AuctionService struct {
 	hub      *ws.Hub
 	rankings *cache.RankingStore
 	viewers  *cache.ViewerCounter
+	producer *mq.Producer
 }
 
-func NewAuctionService(db *gorm.DB, hub *ws.Hub, rankings *cache.RankingStore, viewers *cache.ViewerCounter) *AuctionService {
-	return &AuctionService{db: db, hub: hub, rankings: rankings, viewers: viewers}
+func NewAuctionService(db *gorm.DB, hub *ws.Hub, rankings *cache.RankingStore, viewers *cache.ViewerCounter, producer *mq.Producer) *AuctionService {
+	return &AuctionService{db: db, hub: hub, rankings: rankings, viewers: viewers, producer: producer}
 }
 
 // StartAuctionMonitor runs in background to check auction end times
@@ -548,11 +550,12 @@ func (s *AuctionService) NotifyOutbid(auction *models.Auction, displacedUserIDs 
 // auction (skipping a specific user when skipUserID > 0 — used to skip the
 // winner whose deposit was applied instead of refunded).
 //
-// Best-effort: we do each refund as its own statement rather than a single
-// JOIN-update because the underlying schema's row count is small and the
-// per-row failure surface is easier to reason about. Errors are logged
-// and skipped — leaving a deposit "held" is recoverable (admin can refund
-// manually) whereas double-crediting balance is not.
+// Each refund runs in its own mini-transaction (balance UPDATE + status flip
+// together). A failure on one deposit logs and continues; the remaining
+// deposits are still refunded. This is safe because:
+//   - If balance+status both commit → clean.
+//   - If neither commits (tx rollback) → deposit stays "held"; recoverable by admin.
+//   - Balance + status can never diverge (they're in the same tx).
 func refundAllHeldDeposits(db *gorm.DB, auctionID, skipUserID uint) {
 	var deposits []models.Deposit
 	q := db.Where("auction_id = ? AND status = ?", auctionID, models.DepositHeld)
@@ -565,15 +568,20 @@ func refundAllHeldDeposits(db *gorm.DB, auctionID, skipUserID uint) {
 	}
 	now := time.Now()
 	for _, d := range deposits {
-		if err := db.Model(&models.User{}).Where("id = ?", d.UserID).
-			UpdateColumn("balance", gorm.Expr("balance + ?", d.Amount)).Error; err != nil {
-			log.Printf("refund deposit %d: balance update failed: %v", d.ID, err)
-			continue
-		}
-		db.Model(&d).Updates(map[string]interface{}{
-			"status":     models.DepositRefunded,
-			"settled_at": &now,
+		d := d // capture for closure
+		err := db.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&models.User{}).Where("id = ?", d.UserID).
+				UpdateColumn("balance", gorm.Expr("balance + ?", d.Amount)).Error; err != nil {
+				return err
+			}
+			return tx.Model(&d).Updates(map[string]interface{}{
+				"status":     models.DepositRefunded,
+				"settled_at": &now,
+			}).Error
 		})
+		if err != nil {
+			log.Printf("refund deposit %d (user %d, auction %d): %v", d.ID, d.UserID, auctionID, err)
+		}
 	}
 }
 
@@ -746,8 +754,19 @@ func (s *AuctionService) CancelAuction(auction *models.Auction, reason string) e
 	// a -5. We don't double-count repeat offenders here; the cumulative
 	// effect comes from doing it many times.
 	if auction.BidCount > 0 {
-		AdjustCredit(s.db, auction.SellerID, -5, models.CreditReasonSellerCancelled,
-			"auction", auction.ID, "活跃拍卖被卖家取消")
+		ev := mq.CreditEvent{
+			UserID:  auction.SellerID,
+			Delta:   -5,
+			Reason:  string(models.CreditReasonSellerCancelled),
+			RefType: "auction",
+			RefID:   auction.ID,
+			Note:    "活跃拍卖被卖家取消",
+		}
+		if s.producer != nil && s.producer.Available() {
+			_ = s.producer.Publish(mq.TopicCreditAdjust, mq.FormatKey(auction.SellerID), ev)
+		} else {
+			AdjustCredit(s.db, auction.SellerID, -5, models.CreditReasonSellerCancelled, "auction", auction.ID, "活跃拍卖被卖家取消")
+		}
 	}
 
 	// Reflect changes on the in-memory copy so the caller can return it.

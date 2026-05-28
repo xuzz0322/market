@@ -11,7 +11,9 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"market/cache"
 	"market/models"
+	"market/mq"
 	"market/services"
 	"market/ws"
 )
@@ -20,10 +22,12 @@ type BidHandler struct {
 	db         *gorm.DB
 	hub        *ws.Hub
 	auctionSvc *services.AuctionService
+	cache      *cache.Client
+	producer   *mq.Producer
 }
 
-func NewBidHandler(db *gorm.DB, hub *ws.Hub, svc *services.AuctionService) *BidHandler {
-	return &BidHandler{db: db, hub: hub, auctionSvc: svc}
+func NewBidHandler(db *gorm.DB, hub *ws.Hub, svc *services.AuctionService, c *cache.Client, producer *mq.Producer) *BidHandler {
+	return &BidHandler{db: db, hub: hub, auctionSvc: svc, cache: c, producer: producer}
 }
 
 type PlaceBidRequest struct {
@@ -253,15 +257,70 @@ func (h *BidHandler) PlaceBid(c *gin.Context) {
 	h.auctionSvc.OnBidPlaced(bgCtx, auction.ID, userID, currentUser.Username, currentUser.Avatar, newPrice)
 	bgCancel()
 
+	// Heat incr via Kafka (at-most-once). If Kafka is down we fall back
+	// to the direct Redis path so the score stays approximate but not stale.
+	if h.producer != nil && h.producer.Available() {
+		_ = h.producer.Publish(mq.TopicHeatIncr, mq.FormatAuctionKey(auction.ID), mq.HeatIncrEvent{
+			Kind:      "bid",
+			AuctionID: auction.ID,
+		})
+	} else if h.cache != nil {
+		fallCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		cache.IncrBidDelta(fallCtx, h.cache, auction.ID)
+		cancel()
+	}
+
 	h.auctionSvc.BroadcastBidState(&auction, currentUser.Username)
 
-	// Personal "you've been outbid" alert. Goroutine'd because the user
-	// may be on a different auction or even offline; the push is
-	// fire-and-forget — no need to make the bidder wait on its delivery.
+	// "You've been outbid" notifications via Kafka (at-most-once). Each
+	// displaced user gets a separate message keyed by their user_id so
+	// all their outbid events land on the same partition in order.
+	// Falls back to the in-process goroutine path if Kafka is unavailable.
 	if len(displacedUsers) > 0 {
-		// Reload product so the notification can show the title.
 		h.db.Preload("Product").First(&auction, auction.ID)
-		go h.auctionSvc.NotifyOutbid(&auction, displacedUsers, currentUser.Username, newPrice)
+		productTitle := ""
+		if auction.Product != nil {
+			productTitle = auction.Product.Title
+		}
+		secondsLeft := 0
+		if auction.EndTime != nil {
+			secondsLeft = int(time.Until(*auction.EndTime).Seconds())
+			if secondsLeft < 0 {
+				secondsLeft = 0
+			}
+		}
+
+		// Collect prior bids to show "your ¥X was beaten".
+		type prevBid struct {
+			UserID uint
+			Amount float64
+		}
+		var prev []prevBid
+		h.db.Raw(`SELECT user_id, MAX(amount) as amount FROM bids
+			WHERE auction_id = ? AND user_id IN (?) AND status = ?
+			GROUP BY user_id`, auction.ID, displacedUsers, models.BidOutbid).Scan(&prev)
+		prevByUser := make(map[uint]float64)
+		for _, p := range prev {
+			prevByUser[p.UserID] = p.Amount
+		}
+
+		for _, uid := range displacedUsers {
+			ev := mq.OutbidEvent{
+				AuctionID:    auction.ID,
+				ProductTitle: productTitle,
+				DisplacedUID: uid,
+				YourBid:      prevByUser[uid],
+				NewPrice:     newPrice,
+				NewLeader:    currentUser.Username,
+				SecondsLeft:  secondsLeft,
+			}
+			if h.producer != nil && h.producer.Available() {
+				_ = h.producer.Publish(mq.TopicNotifyOutbid, mq.FormatKey(uid), ev)
+			} else {
+				// Kafka unavailable: push directly via hub (legacy path).
+				h.auctionSvc.NotifyOutbid(&auction, []uint{uid}, currentUser.Username, newPrice)
+			}
+		}
 	}
 
 	if isBuyNow {

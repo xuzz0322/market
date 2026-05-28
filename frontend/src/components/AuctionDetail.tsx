@@ -2,9 +2,9 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import toast from 'react-hot-toast'
-import { ArrowLeft, Eye, Heart, Share2, ChevronUp, Trophy, Zap, Info, Users, AlertTriangle, Package, Sparkles, ShieldCheck } from 'lucide-react'
+import { ArrowLeft, Eye, Heart, Share2, ChevronUp, Trophy, Zap, Info, Users, AlertTriangle, Package, Sparkles, ShieldCheck, UserX, MessageSquare } from 'lucide-react'
 import type { Auction, BidRanking, BidUpdateData, AuctionEndData } from '../types'
-import { getAuction, placeBid, getAuctionRecommendations, getDepositState, payDeposit, type DepositState } from '../services/api'
+import { getAuction, placeBid, getAuctionRecommendations, getDepositState, payDeposit, blockUser, getBlockState, type DepositState } from '../services/api'
 import wsClient from '../services/websocket'
 import { useAuthStore, useFavoritesStore } from '../services/store'
 import CountdownTimer from './CountdownTimer'
@@ -46,9 +46,7 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
   const [cancelled, setCancelled] = useState<{ reason: string } | null>(null)
   const [winner, setWinner] = useState<{ name: string; price: number; winnerId?: number } | null>(null)
   const [likeCount, setLikeCount] = useState(0)
-
-  // Favorites — backed by zustand store, source-of-truth is the server.
-  // We read directly via selector so the heart re-renders only when THIS
+  const [isBlockedSeller, setIsBlockedSeller] = useState(false)
   // auction's state changes (not on every other favorite toggle).
   const isFavorited = useFavoritesStore((s) => s.ids.has(auctionId))
   const toggleFavorite = useFavoritesStore((s) => s.toggle)
@@ -213,7 +211,29 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
     }
   }, [auctionId, loadAuction, resync])
 
-  // Mark this auction as the user's current focus so the global outbid
+  // Load block state for the seller once auction loads.
+  useEffect(() => {
+    if (!auction || !user || user.id === auction.seller_id) return
+    getBlockState(auction.seller_id).then((r) => setIsBlockedSeller(r.blocked)).catch(() => {})
+  }, [auction?.seller_id, user])
+
+  const handleBlockSeller = async () => {
+    if (!auction) return
+    const verb = isBlockedSeller ? '解除拉黑' : '拉黑'
+    if (!confirm(`确定要${verb} @${auction.seller?.username}？`)) return
+    try {
+      if (isBlockedSeller) {
+        const { unblockUser } = await import('../services/api')
+        await unblockUser(auction.seller_id)
+        setIsBlockedSeller(false)
+        toast.success(`已解除拉黑`)
+      } else {
+        await blockUser(auction.seller_id)
+        setIsBlockedSeller(true)
+        toast.success(`已拉黑 @${auction.seller?.username}，该用户的内容不再推荐`)
+      }
+    } catch { toast.error('操作失败') }
+  }
   // notifier can suppress its banner toast for THIS auction (we already
   // show the in-page banner). Cleared on unmount.
   useEffect(() => {
@@ -421,6 +441,28 @@ export default function AuctionDetail({ auctionId: propAuctionId, onClose }: Auc
           <Share2 size={26} className="text-white" />
           <span className="text-white text-xs">分享</span>
         </button>
+
+        {/* Block seller — only visible when viewing someone else's auction.
+            Shows a different icon state when already blocked. */}
+        {user && user.id !== auction.seller_id && (
+          <>
+            {/* DM seller */}
+            <button
+              onClick={() => navigate(`/messages/${auction.seller_id}`)}
+              className="flex flex-col items-center gap-1"
+            >
+              <MessageSquare size={26} className="text-white" />
+              <span className="text-white text-xs">私信</span>
+            </button>
+
+            <button onClick={handleBlockSeller} className="flex flex-col items-center gap-1">
+              <UserX size={26} className={isBlockedSeller ? 'text-red-400' : 'text-white/50'} />
+              <span className={`text-xs ${isBlockedSeller ? 'text-red-400' : 'text-white/50'}`}>
+                {isBlockedSeller ? '已拉黑' : '拉黑'}
+              </span>
+            </button>
+          </>
+        )}
 
         {/* Rules — opens a slide-up drawer with the auction's pricing
             terms. Pulled out of the bottom info area because new users

@@ -42,8 +42,16 @@ const (
 
 	// Follow-system push: sent personally to a user when a host they
 	// follow goes live or starts a new auction.
-	MsgHostLive       MessageType = "host_live"
+	MsgHostLive        MessageType = "host_live"
 	MsgAuctionStarting MessageType = "auction_starting"
+	// MsgHeatUpdate is a global broadcast sent every heat-scan cycle with
+	// the current top-N ranked rooms. Clients use it to re-sort the feed
+	// without polling.
+	MsgHeatUpdate MessageType = "heat_update"
+	// MsgDMReceived is pushed personally to a user when they receive a
+	// private message. Contains sender info and message body so the client
+	// can surface a toast without polling the inbox endpoint.
+	MsgDMReceived MessageType = "dm_received"
 )
 
 // AuctionCancelData is the payload for auction_cancel messages

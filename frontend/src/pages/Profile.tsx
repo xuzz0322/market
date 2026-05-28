@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import toast from 'react-hot-toast'
-import { Trophy, Package, ChevronRight, LogOut, Wallet, X, AlertTriangle, Heart, ShieldCheck, ShieldAlert } from 'lucide-react'
+import { Trophy, Package, ChevronRight, LogOut, Wallet, X, AlertTriangle, Heart, ShieldCheck, ShieldAlert, BarChart2, UserX } from 'lucide-react'
 import { getMe, listAuctions, startAuction, cancelAuction } from '../services/api'
 import { useAuthStore } from '../services/store'
 import type { Auction } from '../types'
@@ -176,6 +176,38 @@ export default function Profile() {
             <div className="text-left">
               <div className="font-bold">收藏与关注</div>
               <div className="text-white/40 text-xs">我心动的拍品 + 关注的主播</div>
+            </div>
+          </div>
+          <ChevronRight size={20} className="text-white/40" />
+        </button>
+
+        <button
+          onClick={() => navigate('/trade-history')}
+          className="w-full bg-white/5 border border-white/5 rounded-2xl p-4 flex items-center justify-between"
+        >
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-cyan-500/20 flex items-center justify-center">
+              <BarChart2 size={20} className="text-cyan-400" />
+            </div>
+            <div className="text-left">
+              <div className="font-bold">交易记录</div>
+              <div className="text-white/40 text-xs">买入 / 卖出历史与金额统计</div>
+            </div>
+          </div>
+          <ChevronRight size={20} className="text-white/40" />
+        </button>
+
+        <button
+          onClick={() => navigate('/blocks')}
+          className="w-full bg-white/5 border border-white/5 rounded-2xl p-4 flex items-center justify-between"
+        >
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-gray-500/20 flex items-center justify-center">
+              <UserX size={20} className="text-gray-400" />
+            </div>
+            <div className="text-left">
+              <div className="font-bold">黑名单</div>
+              <div className="text-white/40 text-xs">管理已拉黑的用户</div>
             </div>
           </div>
           <ChevronRight size={20} className="text-white/40" />
