@@ -95,7 +95,7 @@ func (h *DMHandler) Inbox(c *gin.Context) {
 		LastAt      time.Time  `json:"last_at"`
 		UnreadCount int        `json:"unread_count"`
 	}
-	var rows []convo
+	rows := make([]convo, 0)
 	// One row per peer: the last message (by ID) with this peer, plus
 	// unread count. The subquery picks the max message id per peer pair
 	// so we get the latest message without a separate round-trip.

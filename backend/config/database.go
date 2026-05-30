@@ -46,8 +46,8 @@ func defaultPoolConfig() PoolConfig {
 func InitDB() *gorm.DB {
 	host := getEnv("DB_HOST", "localhost")
 	port := getEnv("DB_PORT", "3306")
-	user := getEnv("DB_USER", "root")
-	password := getEnv("DB_PASSWORD", "root")
+	user := getEnv("DB_USER", "auction_user")
+	password := getEnv("DB_PASSWORD", "auction_pass_2024")
 	dbname := getEnv("DB_NAME", "auction_db")
 
 	// timeout=5s : bail fast if MySQL is down rather than blocking the boot
