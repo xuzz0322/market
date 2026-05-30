@@ -264,7 +264,7 @@ paid ──► held ──┬──► applied  (中标：抵扣最终成交价)
 
 ```bash
 # 启动 MySQL + Redis + Kafka + 后端 + 前端
-docker-compose up -d
+f
 ```
 
 > Kafka 使用 KRaft 模式（无 ZooKeeper），单 broker 开箱即用。
